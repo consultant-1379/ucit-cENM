@@ -1,0 +1,141 @@
+#!/bin/bash
+#
+#*******************************************************************************
+# Version 1.0
+# COPYRIGHT Ericsson 2024
+#
+# The copyright to the computer program(s) herein is the property of
+# Ericsson Inc. The programs may be used and/or copied only with written
+# permission from Ericsson Inc. or in accordance with the terms and
+# conditions stipulated in the agreement/contract under which the
+# program(s) have been supplied.
+#********************************************************************************
+#
+# Purpose: Will run related script downloading it from gerrit
+#          using project ucit-cENM from: ssh://gerrit.ericsson.se:29418/OSS/ENM-Parent/SQ-Gate/com.ericsson.oss.containerisation/ucit-cENM
+#
+#********************************************************************************
+#
+usage() {
+  if ! echo "$cmdName" | grep -q -e '^docker_' ; then
+    echo "$cmdName is a launcher and should be used by symbolic link or renamed as 'docker_desired_script_name'. As alternative run '$cmdname --script-name desired_script_name' [arguments...]"
+  fi
+  echo "Usage: $cmdname --script-name desired_script_name_to_run [desired script options]"
+  echo "  --script-name desired_script_name_to_run        This is a mandatory option if not using rhe docker_.....   'trick'"
+  exit
+}
+#
+#
+if [ -z "$PWD" ]; then
+  export PWD=$(pwd)
+fi
+#
+cmd=$0
+arge=$*
+here=$(dirname $cmd)
+script_name=$(basename $cmd)
+dir_tool=$(cd $(dirname $cmd) ; pwd)
+#
+docker_prefix="armdocker.rnd.ericsson.se/proj-enm"
+#
+#image="docker:dind:latest"
+image="ubuntu:latest"
+myImage="ubuntu-j_team:local"
+#
+container_name=my_tools_container
+#
+docker rm $container_name >/dev/null 2>&1 /dev/null
+#
+tools="
+bash
+xmlindent
+openssh
+jq
+buildah
+helm
+shc
+docker
+git
+build-essential
+"
+#
+sock="/var/run/docker.sock"
+#
+if docker image inspect $myImage > /dev/null ; then
+  image=$myImage
+else
+  docker rmi $image >/dev/null 2>&1 || echo "No image to remove"
+  docker kill $container_name >/dev/null 2>&1 || echo "No container $container_name to kill"
+  docker rm $container_name >/dev/null 2>&1 || echo "No image to remove"
+  if docker pull "$image" ; then
+    echo "Downloaded docker image: $image"
+  else
+    echo "Neither local $image nor docker available"
+    exit
+  fi
+fi
+#
+function init_container() {
+  docker run --name $container_name --init $options --user $(id -u):$(id -g) -w ${PWD} -v $dir_tool:/tools -v ${PWD}:${PWD} -v /var/run/docker.sock:/var/run/docker.sock $(for x in $(id -G); do printf " --group-add %s" "$x"; done) -d $image sleep 10000
+}
+#
+function install_tools() {
+  docker exec -it -u root:root $container_name apt update
+  for t in $tools
+  do
+    echo "Installing $t"
+    docker exec -it -u root:root $container_name apt install -y $t
+  done
+}
+#
+function config_ssh() {
+  if [ ! -d $HOME/.ssh ]; then
+    echo "ERROR: Mandatory directory $HOME/.ssh must exist"
+    exit
+  fi
+  if [ ! -f $HOME/.ssh/config ]; then
+    if ! grep -q gerrit.ericsson.se $HOME/.ssh/config ; then
+      cat >> $HOME/.ssh/config <<_EOF_
+Host gerrit.ericsson.se
+  HostkeyAlgorithms +ssh-rsa
+  PubkeyAcceptedKeyTypes +ssh-rsa
+_EOF_
+    fi
+  fi
+}
+#
+if [ -z "$USER" ]; then
+  USER=$(whoami)
+fi
+#
+grp=/etc/group
+pass=/etc/passwd
+if ! grep $USER $pass ; then
+  pass=/tmp/pass
+  cp /etc/passwd $pass
+  getent passwd $USER >> $pass
+fi
+#
+options="--privileged -v $HOME:$HOME -v $grp:/etc/group -v $sock:$sock -v $pass:/etc/passwd -e USER=$USER"
+#
+init_container
+#
+if [ "$image" != "$myImage" ]; then
+  config_ssh
+  install_tools
+  docker container commit -a "J-Team" -m "Updated image with owner settings" $container_name $myImage
+fi
+#
+#
+if echo $script_name | grep -q -e '^docker_' ; then
+  wanted_cmd=$(echo $script_name | sed 's,/docker_,,' | sed 's,^docker_,,')
+  if [ -f $here/runTool ]; then
+    echo "docker exec $container_name /tools/runTool --script-name $wanted_cmd $*"
+    docker exec $container_name /tools/runTool --script-name $wanted_cmd $*
+  else
+    echo "Error: cannot find $here/runTool"
+  fi
+else
+  usage
+fi
+#

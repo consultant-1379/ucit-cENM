@@ -1,0 +1,2289 @@
+#!/bin/bash
+#
+#*******************************************************************************
+# Version 1.0
+# COPYRIGHT Ericsson 2022
+#
+# The copyright to the computer program(s) herein is the property of
+# Ericsson Inc. The programs may be used and/or copied only with written
+# permission from Ericsson Inc. or in accordance with the terms and
+# conditions stipulated in the agreement/contract under which the
+# program(s) have been supplied.
+#********************************************************************************
+#
+# Purpose: Looking for all mounted secrets and create the related links (if
+#          required) to follow the Credential Manager behaviour.
+#          Only when all the required secrets will be mounted this script will
+#          complete.
+#
+#********************************************************************************
+#
+# Last revision: 2024-04-10
+#
+script_sum=799894421
+script_num=39
+#
+d=$(date +%Y-%m-%d)
+#
+readonly version=$(grep '^# Version' $0 | sed 's/^# Version//')
+#
+readonly revision=$(grep '^# Last revision:' $0 | sed 's/# Last revision://')
+#
+my_sum=$(grep -v '^script_sum=' $0 | cksum | sed 's/ .*//')
+#
+if [ "$my_sum" != "$script_sum" ]; then
+  my_num=$(grep '^script_num=' $0 | sed 's/.*=//')
+  my_num=$(( my_num + 1 ))
+  sed -i "s/^script_num=.*/script_num=$my_num/" $0
+  sed -i "s/^# Last revision:.*/# Last revision: $d/" $0
+  my_sum=$(grep -v '^script_sum=' $0 | cksum | sed 's/ .*//')
+  sed -i "s/^script_sum=.*/script_sum=$my_sum/" $0
+  echo "Changed script version to: $d"
+  echo "Rerun the script"
+  exit
+fi
+#
+docker_build="buildx build"
+docker buildx version > /dev/null 2>/dev/null || docker_build="build"
+#
+# Constants:
+#
+vmRestart=true
+vmTrustRestart=false
+#
+# Real release will be inserted by CI/CD pipeline.
+#
+waitForCertificatesContainer_tag="latest";
+certreqjob_version="latest";
+#
+if [ "$DEBUG" == "true" ]; then
+  echo "HELMCHART_LIBRARY="$(printenv HELMCHART_LIBRARY)
+  echo "RUN_SCRIPT="$(printenv RUN_SCRIPT)
+  echo "REPODIR="$(printenv REPODIR)
+fi
+#
+if [ -z "$HELMCHART_LIBRARY" ]; then
+  helmchart_library_version=latest
+  if [ ! -z "$RUN_SCRIPT" ]; then
+    helmchart_library_version=$($RUN_SCRIPT --script-name get_helmchart.sh -q 2>/dev/null)
+  fi
+else
+  helmchart_library_version="$HELMCHART_LIBRARY"
+fi
+#
+export HELMCHART_LIBRARY="$helmchart_library_version"
+#
+if [ -z "$CERTREQJOB_VERSION" ]; then
+  if [ ! -z "$RUN_SCRIPT" ]; then
+    waitForCertificatesContainer_tag=$($RUN_SCRIPT --script-name get_artifact_version.sh -q 2>/dev/null)
+    certreqjob_version="$waitForCertificatesContainer_tag";
+  fi
+else
+  waitForCertificatesContainer_tag="$CERTREQJOB_VERSION"
+  certreqjob_version="$CERTREQJOB_VERSION"
+fi
+#
+export CERTREQJOB_VERSION="$certreqjob_version"
+#
+updated_files=""
+#
+docker_repo="armdocker.rnd.ericsson.se"
+docker_push_repo="arm.seli.gic.ericsson.se"
+cloud_repo="$docker_repo/proj-enm"
+cloud_staging_repo="$docker_repo/proj_oss_releases/enm"
+cloud_staging_repo_path="$docker_push_repo/artifactory/docker-default/proj_oss_releases/enm"
+#
+# Some variables
+#
+git_url_prefix="OSS/ENM-Parent/SQ-Gate"
+old_git_url_prefix="OSS"
+#
+# enm_monitoring image name to use for local testing
+#
+enm_monitoring=eric-enm-monitoring-
+#
+tlsMountPath="/ericsson/credm/tlsMount"
+xmlMountPath="/ericsson/credm/certReqMount"
+#
+# Get the username to connect the git repository (assumes is same as local user)
+#
+if [ -z "$USER" ]; then
+  USER=$(whoami)
+fi
+#
+user=$USER
+#
+wait_user="false"
+#
+if [ "$1" == "-w" ]; then
+  wait_user="true"
+  shift
+fi
+#
+check="false"
+crl_enable_default="false"
+crl_add="false"
+if [ "$1" == "-crl" ]; then
+  echo "CRL enabled"
+  crl_enable_default="true"
+  shift
+fi
+#
+if [ "$1" == "-check" ]; then
+  echo "check_only"
+  check="true"
+  shift
+fi
+#
+sg_list_file=$(pwd)/sg_list
+#
+if [ ! -z "$1" ]; then
+  sg_list_file=/tmp/sg_list
+  echo "$1" > $sg_list_file
+  echo "#" >> $sg_list_file
+fi
+#
+serial=$(date +%Y%m%d%H%M)
+#
+# Tag to use for local testing images
+#
+tag="j-team-$user-$serial"
+#
+#o Maximum number of build attempt
+#
+max_attempt=3
+#
+echo "Starting $0 USING:"
+#
+dos_to_unix='sed s/\r//'
+#
+note=false
+#
+if which dos2unix >/dev/null 2> /dev/null ; then
+  dos_to_unix=dos2unix
+fi
+#
+remove_tab=cat
+if which expand >/dev/null 2> /dev/null ; then
+  remove_tab=expand
+fi
+#
+function print_note () {
+    local msg="$1"
+    local flag="$2"
+    echo "$msg" | tee -a "$run_dir/patch_notes.txt"
+    if [ -z "$flag" ]; then
+      note=true
+    fi
+}
+#
+# Remove dangling containers reported as "<none>...<none>"
+#
+function clean_docker () {
+  local dangling_images=$(docker images | grep '<none>.*<none>' | awk '{print $3}')
+  for img in $dangling_images
+  do
+  local stopped_containers=$(docker ps -a | grep $img | awk '{print $1}')
+    for c in $stopped_containers
+    do
+      docker rm $c
+    done
+    docker rmi $img
+  done
+}
+#
+function xml_indent () {
+  if which xmlindent >/dev/null 2> /dev/null ; then
+    if [ -f $1 ]; then
+      echo "indenting $1"
+      echo $1 | grep -q '\.xml$' && cat $1 | $dos_to_unix | $remove_tab | \
+         sed -e 's/  */ /g' -e 's/></>\n</g' | \
+         sed -e '/^\s*$/d' | sed -z 's,\n\s*</,</,g' | xmlindent -i 4 > $1.new && mv -f $1.new $1
+      echo "$1 indented"
+    fi
+  fi
+}
+#
+#
+data=$( date +%Y_%m_%d )
+#
+patch_script=$(basename $0)
+#
+function mustExistFile () {
+  if [ ! -f "$1" ]; then
+    local curDir=$(pwd)
+    echo "ERROR: on directory $curDir: $file not found"
+    exit 1
+  fi
+}
+#
+# Fix multiple empty/comments lines 
+#
+function fixEmptyFirstLastLine () {
+  local file=$1
+  if [ -f "$file" ]; then
+    file_temp="$file.unique"
+    cp -f "$file" "$file_temp"
+    sed -i '1{/^$/ d}' "$file"
+    sed -i '${/^$/ d}' "$file"
+    while ! cmp "$file" "$file_temp"
+    do
+      cp -f "$file" "$file_temp"
+      sed -i '1{/^$/ d}' "$file"
+      sed -i '${/^$/ d}' "$file"
+    done
+    rm -f "$file_temp"
+  fi
+}
+#
+# Fix multiple empty/comments lines 
+#
+function fixMultiLines () {
+  local file=$1
+  if [ -f "$file" ]; then
+    sed 's/^ *$//' $file | uniq > $file.unique
+    mv -f $file.unique $file
+  fi
+}
+#
+function fixEofEol () {
+  local file=$1
+  if [ -f "$file" ]; then
+    l=$( tail -n 1 $file 2> /dev/null | wc -l)
+    if [ "$l" == "0" ]; then
+      echo "" >> $file
+    fi
+  fi
+}
+#
+function patchVolumeMounts () {
+  local file="$1"
+  local p_name="$2"
+  local pre_file="$3"
+  local num_xml="$4"
+  local pre_name=""
+  echo "Patching $file"
+
+  certreq="certreq"
+  xml="xml"
+
+  if [ -z "$p_name" ]; then
+    pre_name=""
+  else
+    pre_name="$p_name-"
+  fi
+
+  echo "processing $num_xml $pre_name""cert-secrets"
+  local c=1
+  while [ $c -le $num_xml ];
+  do
+    echo "processing $pre_name$certreq-secret-$c -> $pre_file$c"
+    if grep -q "name: $pre_name$certreq-secret-$c" $file ; then
+      print_note "file:$file    $pre_name$certreq-secret-$c already patched"
+    else
+      cat <<_EOF_ >> $file
+- name: $pre_name$certreq-secret-$c
+  mountPath: {{ .Values.service.xmlMountPath }}/$pre_file$c
+  readOnly: true
+_EOF_
+    fi
+    c=$(( $c + 1 ))
+  done
+  fixMultiLines $file
+}
+#
+function patchOptionalVolumes() {
+  local file="$1"
+  local p_name="$2"
+  local num_xml="$3"
+  local num_tls="$4"
+  local pre_name=""
+  echo "Patching $file"
+
+  certreq="certreq"
+  tls="tls"
+
+  if [ -z "$p_name" ]; then
+    pre_name=""
+  else
+    pre_name="$p_name-"
+  fi
+  echo "Processing $file for $num_xml $pre_name$certreq-secret (xml files) with a total of $num_tls tls-secrets"
+  if [ ! -f $file ]; then
+    > $file
+  else
+    fixEofEol $file
+  fi
+  local s=1
+  while [ $s -le $num_xml ];
+  do
+    echo "processing $pre_name$certreq-secret-$s"
+    if grep "^- name: $pre_name$certreq-secret-$s" $file ; then
+      print_note "WARNING: name: $pre_name$certreq-secret-$s already present on $file"
+    else
+      cat <<_EOF_ >> $file
+- name: $pre_name$certreq-secret-$s
+  secret:
+    secretName: "{{ .Values.service.name }}-$pre_name$certreq-secret-$s"
+_EOF_
+    fi
+    s=$(( $s + 1 ))
+  done
+
+  local t=1
+  while [ $t -le $num_tls ];
+  do
+    echo "processing $pre_name$tls-secret-$t"
+    if grep "^- name: $pre_name$tls-secret-$t" $file ; then
+      print_note "WARNING: name: $pre_name$tls-secret-$t already present on $file"
+    else
+      cat <<_EOF_ >> $file
+- name: $pre_name$tls-secret-$t
+  secret:
+    secretName: "{{ .Values.service.name }}-$pre_name$tls-secret-$t"
+_EOF_
+    fi
+    t=$(( $t + 1 ))
+  done
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+}
+#
+function patchCertificateSecrets() {
+  local file="$1"
+  local pre="$2"
+  local script="$3"
+  local p_xml_files=$( echo "$4" )
+  local p_xml_files_dir=appconfig/certificatesdata
+  local prefix=""
+  n_xml=0
+  echo "patchCertificateSecrets '$file' '$prefix' '$script' '$p_xml_files'"
+
+  if [ -z "$pre" ]; then
+    prefix=""
+  else
+    prefix="$pre-"
+  fi
+
+  certreq="certreq"
+  tls="tls"
+  n_xml=0
+  for xml in $p_xml_files
+  do
+    n_xml=$((n_xml + 1))
+    local p_xml_file=$(basename $p_xml_files_dir/$xml)
+    echo "Processing entry $prefix$certreq-secret-$n_xml related to $p_xml_file file"
+    if grep -q ".-$prefix$certreq-secret-$n_xml" $file ; then
+      print_note "file:$file   $prefix$certreq-secret-$n_xml already patched"
+    else
+      cat <<_EOF_ >> $file
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.service.name }}-$prefix$certreq-secret-$n_xml
+  labels:
+    serviceName: {{ .Values.service.name }}
+    certRequest: "true"
+type: Opaque
+stringData:
+  certReqName: "$p_xml_file"
+  certReqData: {{ .Files.Get "appconfig/certificatesdata/$p_xml_file" | quote }}
+_EOF_
+      if [ ! -z "$script" ]; then
+        echo "  certReqScript: $script" >> $file
+      fi
+      cat <<_EOF_ >> $file
+# this field in not present at start-up (first installation):
+# it is inserted during certs generation phase
+#  certReqState:
+---
+_EOF_
+    fi
+  done
+  echo "Inserted $n_xml certreq secrets inside $file"
+
+  n_xml=0
+  n_tls=0
+  local cert_dir_list=""
+  #
+  for xml in $p_xml_files
+  do
+    p_xml_file=$p_xml_files_dir/$xml
+    echo "Pre processing xml file $p_xml_file"
+    n_xml=$((n_xml + 1))
+    sed -i -e '/<!--/s,storefolder,__store_folder__,g' $p_xml_file
+    sed -i -e '/<!--/s,storelocation,__store_location__,g' $p_xml_file
+    sed -i -e '/<!--/s,keyfilelocation,__keyfile_location__,g' $p_xml_file
+    sed -i -e '/<!--/s,certificatefilelocation,__certificate_location__,g' $p_xml_file
+    sed -i -e '/<!--/s,crlstore,__crlstore__,g' $p_xml_file
+
+    sed -i -e 's/<!--\(.*\)-->/<_!_--\1--_>/g' $p_xml_file
+
+    sed -i -e '/<!--/,/-->/s,storefolder,__store_folder__,g' $p_xml_file
+    sed -i -e '/<!--/,/-->/s,storelocation,__store_location__,g' $p_xml_file
+    sed -i -e '/<!--/,/-->/s,keyfilelocation,__keyfile_location__,g' $p_xml_file
+    sed -i -e '/<!--/,/-->/s,certificatefilelocation,__certificate_location__,g' $p_xml_file
+    sed -i -e '/<!--/,/-->/s,crlstore,__crlstore__,g' $p_xml_file
+
+    sed -i -e '/<crlstore>/,/<.crlstore>/s,storefolder,__store_folder__,g' $p_xml_file
+    sed -i -e '/<crlstore>/,/<.crlstore>/s,storelocation,__store_location__,g' $p_xml_file
+    sed -i -e '/<crlstore>/,/<.crlstore>/s,keyfilelocation,__keyfile_location__,g' $p_xml_file
+    sed -i -e '/<crlstore>/,/<.crlstore>/s,certificatefilelocation,__certificate_location__,g' $p_xml_file
+
+    echo "Processing locations on xml file $p_xml_file"
+    sed -i -e 's,<storefolder>\([^<]*\)</storefolder>,<storelocation>\1/trustca_all.pem</storelocation>,' -e 's,//trustca_all,/trustca_all,' $p_xml_file
+    local cert_path_list=$(grep -E "<storelocation>|<keyfilelocation>|<certificatefilelocation>" $p_xml_file | sed -e 's,</.*location>.*,,' -e 's/.*location>//')
+    local trust_path_list=$(sed -n '\_<truststore>_,\_</truststore>_p' $p_xml_file | grep "<storelocation>" | sed -e 's,</.*location>.*,,' -e 's/.*location>//')
+    cert_path_list=$( (for x in $cert_path_list ; do echo $x | sed 's,/*$,,' ; done )| sort -u)
+    trust_path_list=$( (for x in $cert_path_list ; do echo $x | sed 's,/*$,,' ; done )| sort -u)
+    local cert_script=""
+    if sed -n '\_<oncheckresult>_,\_</oncheckresult>_p' $p_xml_file | grep "VMRestart" ; then
+      vmRestart=true
+    fi
+    if sed -n '\_<oncheckresult>_,\_</oncheckresult>_p' $p_xml_file | grep "trustUpdate" ; then
+      vmTrustRestart=true
+    fi
+    if grep "RunScript" $p_xml_file ; then
+      local cert_script=$(sed -n '\_<oncheckresult>_,\_</oncheckresult>_p' $p_xml_file | grep "<pathname>" | sed -e 's,</pathname>.*,,' -e 's/<pathname>//' -e 's/  */_-_/f')
+    fi
+    # Get only first entry
+    cert_script=$( for x in $cert_script ; do echo $x ; break ; done )
+    local file_tls_num=$(echo "$cert_path_list" | wc -w)
+    file_tls_num=0
+    for cp in $( echo "$cert_path_list" )
+    do
+      echo "  Adding $cp certificate path"
+      file_tls_num=$((file_tls_num + 1))
+      dir_name=$(basename $cp)
+      cert_dir_list="$cert_dir_list $dir_name"
+      cert_dir_list=$( (for x in $cert_dir_list ; do echo $x ; done )| sort -u)
+      if [ ! -z "$cert_script" ]; then
+        cert_script_list=$( (for x in $cert_script_list "$cp:$cert_script"; do echo $x ; done )| sort -u)
+      fi
+    done
+
+    fpem="";
+    fjks="";
+    fp12="";
+    if [ $crl_enable == "true" ]; then
+      echo "CRL is Enabled"
+      if grep -q '<crlstore>' $p_xml_file ; then
+        echo "Found <crlstore> in $p_xml_file"
+	local trust_path_list=$( sed -n "\_<truststore>_,\_</truststore>_p" $p_xml_file | sed 's/\r//' | expand | sed -e 's, *,,' | grep -E "<storelocation>|<keyfilelocation>|<certificatefilelocation>" | sed -e 's,</.*location>.*,,' -e 's/.*location>//' )
+	echo "Adding updateCRL.sh script"
+	for cp in $( echo "$trust_path_list" )
+	do
+	  if echo "$cp" | grep -q "\.pem$" ; then
+	    fpem=$cp;
+	  fi
+	  if echo "$cp" | grep -q "\.jks$" ; then
+	    fjks=$cp;
+	  fi
+	  if echo "$cp" | grep -q "\.p12$" ; then
+	    fp12=$cp;
+	  fi
+	done
+	if [ -z "$fpem" ] && [ -z "$fjks" ] && [ -z "$fp12" ]; then
+	  print_note "WARNING crlstore found but no known extension found"
+	else
+	  crl_runscript="/usr/lib/ocf/resource.d/updateCRL.sh_-_force"
+	  if [ "$vmTrustRestart" != "true" ]; then
+	    if [ ! -z "$fpem" ]; then
+	      if ! echo "$cert_script_list" | grep -q "$fpem:/usr/lib/ocf/resource.d/updateCRL.sh"; then
+		cert_script_list=$( (for x in $cert_script_list "$fpem:$crl_runscript"; do echo $x ; done )| sort -u)
+	      fi
+	    fi
+	    if [ ! -z "$fjks" ]; then
+	      if ! echo "$cert_script_list" | grep -q "$fjks:/usr/lib/ocf/resource.d/updateCRL.sh"; then
+		cert_script_list=$( (for x in $cert_script_list "$fjks:$crl_runscript"; do echo $x ; done )| sort -u)
+	      fi
+	    fi
+	    if [ ! -z "$fp12" ]; then
+	      if ! echo "$cert_script_list" | grep -q "$fp12:/usr/lib/ocf/resource.d/updateCRL.sh"; then
+		cert_script_list=$( (for x in $cert_script_list "$fp12:$crl_runscript"; do echo $x ; done )| sort -u)
+	      fi
+	    fi
+	  fi
+	fi
+	crl_add="true"
+      fi
+    fi
+    if [ ! -z "$cert_script_list" ]; then
+      echo "Found RunScript:"
+      echo "  cert_script_list=$cert_script_list"
+    fi
+    echo "File $p_xml_file contains $file_tls_num secrets"
+    t=1
+    while [ $t -le $file_tls_num ];
+    do
+      if [ $n_tls != "0" ]; then
+        echo "---" >> $file
+      fi
+      n_tls=$((n_tls + 1))
+      echo "Processing entry $prefix$tls-secret-$n_tls related to $prefix$certreq-secret-$n_xml extracted from $p_xml_file file"
+      echo "File $p_xml_file contains $file_tls_num secrets"
+      if grep -q ".-$prefix$tls-secret-$n_tls" $file ; then
+        print_note "file:$file   $prefix$tls-secret-$n_tls already patched"
+      else
+        cat <<_EOF_ >> $file
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.service.name }}-$prefix$tls-secret-$n_tls
+  labels:
+    certReqName: "{{ .Values.service.name }}-$prefix$certreq-secret-$n_xml"
+type: Opaque
+# these fields are not present at start-up (first installation):
+# they are inserted during certs generation phase
+#stringData:
+#  tlsStoreLocation:
+#  tlsStoreType:
+#data:
+#  tlsStoreData:
+_EOF_
+      fi
+      t=$(( $t + 1 ))
+    done
+    echo "Post processing xml file $p_xml_file"
+    sed -i -e 's/__crlstore__/crlstore/g' $p_xml_file
+    sed -i -e 's,__certificate_location__,certificatefilelocation,g' $p_xml_file
+    sed -i -e 's,__keyfile_location__,keyfilelocation,g' $p_xml_file
+    sed -i -e 's,__store_location__,storelocation,g' $p_xml_file
+    sed -i -e 's,__store_folder__,storefolder,g' $p_xml_file
+
+    sed -i -e 's/<_!_--\(.*\)--_>/<!--\1-->/g' $p_xml_file
+
+    if [ $crl_enable != "true" ]; then
+      sed  -i -e '/<crlstore>/,/<.crlstore>/d' -e '/>crlUpdate</d' $p_xml_file
+    fi
+
+  done
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+
+  echo "Found $n_tls tls secrets inside $n_xml $prefix""xml files"
+
+}
+#
+function add_updated_file() {
+  p=$(pwd)/$1
+  if [ -f $p ] || [ -d $p ]; then
+    updated_files=$( (for x in $updated_files $p ; do echo $x ; done )| sort -u)
+    echo "Adding to git files $p"
+  fi
+}
+#
+dir="CENM_$data"
+#
+rm -rf $dir 2>/dev/null
+mkdir $dir
+#
+# For users with username on this machine different than the signum, uncomment the line below inserting own signum.
+#
+#user=put_here_your_signum
+#
+# Extract httpd_xml_extra directory if doesn't exist
+#
+if [ ! -d httpd_xml_extra ]; then
+  cat <<_EOF_ | base64 -d | tar zxvf -
+H4sIANI+hWEAA+2UUW/aMBDHeaWfIgvPwUkaSlWFVBVrpUoFbe0q7Q2ZxAWvIc5sp8A+/c5JKITB
+y7R2D71fXnLnv+/OvkvmWufJZLVIJ2ylJSWtN8AF+r1ey/W9Xi/wWq7X74Gr9Ne0vAAe/7Tv931Y
+D1zfb1m9tyhmn0JpKi2rxaSY5vTlqI4Vikn1HhW9K/O9/g8lS0bO8O7WGTKp79nPgintlKouqP4q
+h2nwWRAc67/veWfN/oPu1G1Z7j8+60E+eP/DS+iq9QJH4yIb2F7XtS2WxSLh2WxgP367cc7ty+gk
+pHme8phqUCkLtmTqYqX4wDaTcUHIcrnsLk+7Qs6I77oe+T66e4jnbEEdnsEFZzGzLdBfZGJMF0zl
+NGbV+p2ogg5sM2/8yeRg9dh1Vyqxo5P2bnIw22G8lSrjaHhKRzvUU/WHsx2qYvqDxbo22yHLNNfr
+DGqKOp25UNq8djqTcuBDsrO82ZFwpeFuCq7mpX84Htx8/TwOyf5CnZE0UobkUF1QRlKlyqV44ikr
+A1yPR5OHtdJsMXm8nVx/MeUckFURntk6p1xustam4r9Y5LvBeUh2PU0RTWdCcj1fRPcPV6/Crbcu
+vJHB7FVayNdYU6rYWbDnhfs2Fk05VdEVNH3OTJfhTrbujRK2miOl9TxEhOmY5M+c6FSRXPIXuC2y
+jdEFfVlTY9Mm2M4NHw9qRGo3ZGxKO7Z1085DBy0Lqe3wk+NUNYgsg74LuaAZnbEkMjOlhhsvZNoX
+OE41zGRvQBoOVX0BMi3yBMyFSGAGZToWelSFAXVjEb4f0vyAQvMrK8OYl3KIpBBw9ldzszaTosh3
+FivbRKxCNCJDZf/7b4YgCIIgCIIgCIIgCIIgCIIgCIIgCIIgH5PfWj779QAoAAA=
+_EOF_
+fi
+#
+if [ ! -f $sg_list_file ]; then
+  cat > $sg_list_file <<_EOF_
+eric-enmsg-web-push-service:no_fix_torf:httpd_xml_extra
+_EOF_
+fi
+#
+sg_list=$(grep -v '^#' $sg_list_file | sed 's/:.*//')
+#
+if [ -f torf_list ]; then
+  torf_list=$(cat torf_list)
+else
+  torf_list=""
+fi
+#
+other_sg=""
+#
+var_list="
+vmRestart
+helmchart_library_version
+waitForCertificatesContainer_tag
+certreqjob_version
+docker_repo
+cloud_repo
+cloud_staging_repo
+cloud_staging_repo_path
+tag
+user
+serial
+enm_monitoring
+"
+#
+for s in $var_list
+do
+  val=$(eval "echo '$'$s")
+  echo -n "       $s="; eval "echo $val"
+done
+echo ""
+#
+run_dir=$(pwd)
+#
+> "$run_dir/patch_notes.txt"
+#
+print_note "Starting $0 release: $revision version: $version num:$my_num sum:$my_sum" "ok"
+#
+print_note "Command run: $0 $*" "ok"
+#
+cd $dir
+#
+projects=$sg_list
+torf="NOJIRA"
+#
+echo "Start patching all the projects on current dir: " $(pwd)
+echo ""
+
+here=$(pwd)
+for prj in $projects
+do
+  template_xml_files="false"
+  cert_dir_list=""
+  xml_files=""
+  httpd_xml_files=""
+  extra_xml_files=""
+  cert_script_list=""
+  project=$prj
+  note=false
+  cd $here
+
+  echo "Processing $prj"
+  if [ -d $run_dir/$prj ]; then
+    prj="$run_dir/$prj"
+  fi
+  if echo $prj | grep -q "/" ; then
+    prj_dir=$(dirname $prj)
+    project=$(basename $prj)
+    prj_path=$(cd $run_dir >/dev/null 2>&1 ; cd $prj_dir >/dev/null 2>&1 ; echo $(pwd)/$project)
+    echo "COPYING $prj_path to $here/$project"
+    cp -R $prj_path $project
+  else
+    echo "CLONING $prj"
+    if git clone ssh://$user@gerrit.ericsson.se:29418/$git_url_prefix/com.ericsson.oss.containerisation/$prj 2>/dev/null ; then
+      echo "git clone ssh://$user@gerrit.ericsson.se:29418/$git_url_prefix/com.ericsson.oss.containerisation/$prj"
+    else
+      if git clone ssh://$user@gerrit.ericsson.se:29418/$old_git_url_prefix/com.ericsson.oss.containerisation/$prj 2>/dev/null ; then
+        echo "git clone ssh://$user@gerrit.ericsson.se:29418/$old_git_url_prefix/com.ericsson.oss.containerisation/$prj"
+      else
+        print_note "ERROR: cloning project: ssh://$user@gerrit.ericsson.se:29418/$old_git_url_prefix/com.ericsson.oss.containerisation/$prj"
+      fi
+    fi
+    if [ -d $prj ]; then
+      scp -p -P 29418 $user@gerrit.ericsson.se:hooks/commit-msg $prj/.git/hooks/
+    else
+      print_note "ERROR: cloning project $prj"
+      continue
+    fi
+  fi
+  echo "---"
+
+  echo "------------------------------------------------------------------------------------------------"
+  print_note "" "ok"
+  print_note "PROCESSING $project" "ok"
+  echo ""
+
+  cd $here/$project
+
+  scriptName=$(basename $0)
+  thisDir=$(pwd)
+
+  echo "running $scriptName"
+
+  if [ ! -d chart ]; then
+    print_note "ERROR: Missing chart directory on project $project"
+    print_note "" "ok"
+    print_note "----" "ok"
+    print_note "" "ok"
+    continue
+  fi
+
+  if [ ! -d chart/$project ]; then
+    print_note "ERROR: Missing chart/$project on project $project"
+    print_note "" "ok"
+    print_note "----" "ok"
+    print_note "" "ok"
+    continue
+  fi
+
+  chartDir=chart/$project;
+
+  if [ -d ../$project.beforePatch ]; then
+    print_note "Found .$project.beforePatch save directory. It seems that this directoriy is already patched. on project $project"
+    print_note "" "ok"
+    print_note "----" "ok"
+    print_note "" "ok"
+    continue
+  else
+    mkdir ../$project.beforePatch
+    cp -R . ../$project.beforePatch/
+  fi
+
+  #
+  # Building the docker image
+  #
+  dockerfile=""
+  #
+  if [ -f Dockerfile ]; then
+    dockerfile="Dockerfile"
+  fi
+  if [ -f dockerfile ]; then
+    if [ -z "$dockerfile" ]; then
+      dockerfile="dockerfile"
+    else
+      print_note "WARNING: BOTH Dockerfile and dockerfile are on $project directory"
+      print_note "WARNING: Dockerfile will be used for $project"
+    fi
+  fi
+  #
+  echo "Patching $dockerfile"
+
+  if [ -f $dockerfile ] || [ -f buildah__generate_images.sh ]; then
+    tmp_container="deleteme_$$"
+    tmp_tag="tmp-j-team"
+    echo "Building image"
+    image_name="armdocker.rnd.ericsson.se/proj-enm/$project:$tmp_tag";
+    if [ -f buildah__generate_images.sh ]; then
+      cp buildah__generate_images.sh buildah__generate_images_temp.sh
+      sed "s/image_version=.*/image_version=$tmp_tag/" buildah__generate_images.sh > buildah__generate_images_temp.sh
+      chmod a+x buildah__generate_images.sh
+      ./buildah__generate_images_temp.sh
+      buildah from "$image_name"
+      rm -rf container_xmlfiles_extracted 2>/dev/null
+      buildah run $project -- sh -c "cd ericsson/credm/data ; tar zcf - xmlfiles" | tar zxvf - && mv xmlfiles container_xmlfiles_extracted
+      chmod -R u+rwX container_xmlfiles_extracted
+      buildah rm "$project"
+      buildah rmi "$image_name"
+    else
+      cnt=1
+      sed 's/ --noscripts//' $dockerfile > ${dockerfile}.scripts
+      while true
+      do
+        clean_docker
+        pwd=$(pwd)
+        echo "Building project from $pwd dir using:  docker $docker_build -f ${dockerfile}.scripts --network=host -t \"$image_name\" ."
+        if docker $docker_build -f ${dockerfile}.scripts --network=host -t "$image_name" . ; then
+          echo "$image_name build ok"
+          break;
+        else
+          print_note "Build n. $cnt failed, will try using original dockerfile without removing the --noscripts"
+          echo "Building project from $pwd dir using:  docker $docker_build -f ${dockerfile} --network=host -t \"$image_name\" ."
+          if docker $docker_build -f ${dockerfile} --network=host -t "$image_name" . ; then
+            echo "$image_name build ok"
+            break;
+          else
+            if [ $cnt -le $max_attempt ]; then
+              echo "WARNING error building $image_name attempt $cnt/$max_attempt"
+            else
+              print_note "ERROR building $image_name did you forget to login using command: 'docker login $docker_repo ?"
+              docker_server_name=$(docker info | grep "^Name:" | sed 's/Name: //')
+              if hostname | grep -q "$docker_server_name" ; then
+                print_note "  Using local docker environment"
+              else
+                print_note "  Using docker on $docker_server_name"
+              fi
+              print_note "" "ok"
+              print_note "----" "ok"
+              print_note "" "ok"
+              continue 2
+            fi
+          fi
+        fi
+        echo "WAITING 10 sec before retrying docker $docker_build attempt $cnt/$max_attempt"
+        sleep 10
+        cnt=$(( $cnt + 1 ));
+      done
+      rm ${dockerfile}.scripts
+      #
+      # As trick will create from the docker image, a container ready to be run named "deleteme_$$"
+      #
+      docker create --name="$tmp_container" "$image_name"
+      #
+      # This command will extract ericsson/credm/data/xmlfiles directory from the created container
+      #
+      # Removing old extraction directory if any
+      #
+      rm -rf container_xmlfiles_extracted 2>/dev/null
+      #
+      # Copy out the ericsson/credm/data/xmlfiles directory from the container
+      #
+      echo "Extracting ericsson/credm/data/xmlfiles dir"
+      docker export $tmp_container | tar xf - ericsson/credm/data/xmlfiles
+      chmod -R u+rwX ericsson/
+      mv ericsson/credm/data/xmlfiles container_xmlfiles_extracted
+      rmdir -p ericsson/credm/data
+      #
+      # Deleting the temporary container that is no longer useful.
+      #
+      echo "Deleting container $tmp_container"
+      docker rm $tmp_container
+      #
+      # Deleting the temporary image to free space.
+      #
+      echo "Deleting image $image_name"
+      docker rmi "$image_name"
+    fi
+    #
+    crl_enable=$crl_enable_default
+    if grep "$project" $sg_list_file | egrep -q ":no_crl" ; then
+      crl_enable=false
+    fi
+    if grep "$project" $sg_list_file | egrep -q ":crl" ; then
+      crl_enable=true
+    fi
+    #
+    if grep "$project" $sg_list_file | egrep -q ":no_fix_torf|:no_vmRestart" ; then
+      vmRestart=false
+    else
+      vmRestart=true
+    fi
+    if grep "$project" $sg_list_file | grep -q ":template_xml_files" ; then
+      template_xml_files=true
+    else
+      template_xml_files=false
+    fi
+    cert_dir="chart/$project/appconfig/certificatesdata"
+    if grep -Eq "^$project:|^$project$|/$project:|/$project$" $sg_list_file; then
+      echo "Reading $sg_list_file for $project"
+      if [ ! -d "$cert_dir" ]; then
+        mkdir -p "$cert_dir"
+      fi
+      if [ -d chart/$project/appconfig/sidecars/httpd ]; then
+        #
+        # Create preProcessingScript-httpd.sh inside $cert_dir
+        #
+        echo "Creating preProcessingScript-httpd.sh"
+        extract_dir=""
+        pre_proc_dir="$cert_dir"
+        pre_proc_httpd="preProcessingScript-httpd.sh"
+        if [ -f "$pre_proc_dir/$pre_proc_httpd" ]; then
+          extract_dir="tmp"
+          mkdir -p "$pre_proc_dir/$extract_dir"
+        fi
+        cat <<_EOF_ | base64 -d | (cd $pre_proc_dir/$extract_dir >/dev/null 2>&1 ; tar zxvf -)
+H4sIABAuHmIAA+2Wb4/aRhDGee1PMfVRJVHlM9CjSK0uFTUmZ5UDakyUqqqQsQe8iv9ld33JNc13
+79g4IXC+3rVC6Yvu7x3e2WefnZkdkXOc8yxAIVi6XQSc5dKIpMzDcxG1TkSHGPT7rU6v2+9fdFud
+7qBPn6rvxEX3216re9HrDC56g063XP+uNxi0oHMqA39HIaTPAVrIs3Xu39wbh4VALr6Eoy/K2Vfm
+mqXm2heRdmacEO3slGhnYM3mv7rOiysPbM4CIbIUetRRtOJFCEGW33K2jSTIDGT1IckLiRxynm25
+n0CEHFkKTFTL9DVHLm8h25BCkKUhkyxLBQjJ8iL2JYZA0WWov+WICabSpDDJ/UBCkYak/DZiQVSG
+kMKnU/wbhDViCqLI85hheH7qTJy0SmT9yvPmMOdo5J8GAYhqEmgaRz/M0vgWXkxmPw0nq7k7m9uu
+59iLS93Eug6mzLgZ+tI3t3G29uPzOrkMhb5XsFx7dL0aDb3h6tX15PPtAccw2Qm8S+INi1GYFn27
+NqyJY1ik5OKbAsXHyURBurZ0yIy9WC1s96Xtrl4OJ0v7Utc1DYMoA91+ZVtLz5lNgaKMhTd0PVhY
+rjP3YJNxeFA+zd5etp+SJ4Rv9K89/VmtaxWcUyuAZAnC99CmOL1eakhvg52diQU4lbPVztkjLIEv
+69OoZK49HMHYnV3XdYF9XeoDgwiD19BQD7aB38DYgN6+U1Idfv+hbOdUA6Ixwe2n9BjyozW4KwV/
+QlBIMEJ4cvmkPK5nPKtUd+6O9t/4cYGw4VnSJEVZbvKiV3q76/xB12mMObjRveenmaQS0KMun3xD
+Xva73zEJ3ernhmkYC/zsUg3WpzMPxrPldLSTqLfT1nKeXdnWz+Bd2WUfLOypZdMsAnoaMHYmNgyn
+I1jO6bnY4HgHRfXJZ5FXrflgG++rffj8DhNTJ6XULB//cWwVE+TQfn+48AFMmeQPPdXdburexwRT
+3wiavAaCLszxL6Op2X7fVNgP5laH53cN9Z6bId6YaRHH+/Zo/0iCb6BzTzMcXRfKAVQnOKQpHtBM
+3JDebV3Dj0V/lACMh1TM0b6DePL4pN3tuH+icNydRybvb816YlH//bvRWUl1tP/6n41CoVAoFAqF
+QqFQKBQKhUKhUCgUCoVCoVD8v/gLYzXbhQAoAAA=
+_EOF_
+        if [ "$extract_dir" != "" ]; then
+          if ! cmp -s "$pre_proc_dir/$pre_proc_httpd" "$pre_proc_dir/$extract_dir/$pre_proc_httpd" ; then
+            mv "$pre_proc_dir/$extract_dir/$pre_proc_httpd" "$pre_proc_dir/$pre_proc_httpd.from_script"
+            print_note "WARNING $pre_proc_httpd is different than expected"
+            print_note "  Please compare $pre_proc_httpd with $pre_proc_httpd.from_script to check for differences"
+          else
+            rm -rf "$pre_proc_dir/$extract_dir/"
+          fi
+          rmdir "$pre_proc_dir/$extract_dir/"
+        fi
+      fi
+      extra_xml_dirs=""
+      for extra_dir in $(grep -E "^$project:|^$project$|/$project:|/$project$" $sg_list_file | sed 's/.*://' | sed 's/,/ /g')
+      do
+        echo "Using extra xml dir $extra_dir on project $project"
+        extra_xml_dirs=$(echo $extra_xml_dirs $run_dir/$extra_dir)
+      done
+      for extra_xml_dir in $extra_xml_dirs
+      do
+        tmp_httpd_xml_files=""
+        tmp_extra_xml_files=""
+        echo "Copy extra xml files from $extra_xml_dir"
+        if echo $extra_xml_dir | grep -q "httpd_" ; then
+          if [ ! -d $cert_dir ]; then
+            mkdir -p $cert_dir
+          fi
+          echo "Adding $extra_xml_dir to httpd_xml_files"
+          tmp_httpd_xml_files=$(cd $extra_xml_dir >/dev/null 2>&1 ; echo "$httpd_xml_files" ; grep -l CertificateRequest.xsd *.[xX][mM][lL] 2>/dev/null)
+        else
+          echo "Adding $extra_xml_dir to extra_xml_files"
+          tmp_extra_xml_files=$(cd $extra_xml_dir >/dev/null 2>&1 ; echo "$extra_xml_files" ; grep -l CertificateRequest.xsd *.[xX][mM][lL] 2>/dev/null)
+        fi
+        for xf in $tmp_extra_xml_files $tmp_httpd_xml_files
+        do
+	  if [ -f $extra_xml_dir/$xf ]; then
+            cp $extra_xml_dir/$xf $cert_dir
+	  fi
+        done
+        extra_xml_files=$( (for x in $tmp_extra_xml_files $extra_xml_files ; do echo $x ; done )| sort -u)
+        httpd_xml_files=$( (for x in $tmp_httpd_xml_files $httpd_xml_files ; do echo $x ; done )| sort -u)
+      done
+    fi
+    if [ -d container_xmlfiles_extracted ]; then
+      for xml in $( grep -l CertificateRequest.xsd container_xmlfiles_extracted/*.[xX][mM][lL] /dev/null 2> /dev/null )
+      do
+        echo "Copying xml file $xml"
+        xml_indent $xml
+        xml_file=$(basename $xml)
+        xml_files=$( (for x in $xml_files $xml_file; do echo $x ; done )| sort -u)
+        if [ ! -d $cert_dir ]; then
+          mkdir -p $cert_dir
+        fi
+        if [ -f container_xmlfiles_extracted/$xml_file ]; then
+          if [ -f $cert_dir/$xml_file ]; then
+            print_note "WARNING: $xml_file already present in $cert_dir"
+          fi
+          cp container_xmlfiles_extracted/$xml_file $cert_dir 2> /dev/null
+        fi
+      done
+    fi
+    #
+    # Check for files inside /ericsson/credm/data/xmlfiles/template/
+    #
+    if [ -d container_xmlfiles_extracted/template ]; then
+      for xml in $( grep -l CertificateRequest.xsd container_xmlfiles_extracted/template/*.[xX][mM][lL] /dev/null )
+      do
+        echo "Processing xml file $xml"
+        xf=$(basename "$xml")
+        if echo "$httpd_xml_files $extra_xml_files" | grep -q "$xf" ; then
+          print_note "Found $xml but is already included by extra files"
+        else
+          xml_indent $xml
+          xml_file=$(basename $xml)
+          if [ ! -d $cert_dir ]; then
+            mkdir -p "$cert_dir"
+          fi
+          if [ -f "$cert_dir/$xml_file" ]; then
+            if ! cmp "$xml" "$cert_dir/$xml_file"; then
+              print_note "WARNING DUPLICATE xml file found on project $project check /ericsson/credm/data/xmlfiles/template/$xml_file against /ericsson/credm/data/xmlfiles/$xml_file"
+              if [ -f container_xmlfiles_extracted/template/$xml_file ]; then
+                if [ $template_xml_files == "true" ]; then
+                  cp container_xmlfiles_extracted/template/$xml_file $cert_dir/$xml_file.DUP
+                fi
+              fi
+            fi
+          else
+            if [ -d image_content ]; then
+              if grep -r "$xml_file" image_content ; then
+                refs=$(grep -lr "$xml_file" image_content)
+                if [ $template_xml_files == "true" ]; then
+                  print_note "WARNING $xml_file found inside /ericsson/credm/data/xmlfiles/template/ will copy it inside $cert_dir"
+                  print_note "        referenced by $refs"
+                  if [ -f container_xmlfiles_extracted/template/$xml_file ]; then
+                    cp container_xmlfiles_extracted/template/$xml_file $cert_dir
+                  fi
+                  xml_files="$xml_files $xml_file"
+                else
+                  print_note "WARNING $xml_file found inside /ericsson/credm/data/xmlfiles/template referenced by script inside image_content but template processing is disabled"
+                  print_note "        referenced by $refs"
+                fi
+              else
+                print_note "WARNING $xml_file found inside /ericsson/credm/data/xmlfiles/template/ but no references found inside image_content/* files"
+              fi
+            fi
+          fi
+        fi
+      done
+    fi
+    #
+    xml_files=$( (for x in $xml_files $extra_xml_files ; do echo $x ; done )| sort -u)
+    httpd_xml_files=$( (for x in $httpd_xml_files ; do echo $x ; done )| sort -u)
+    #
+    for xml in $( grep -l CertificateRequest.xsd $cert_dir/*.[xX][mM][lL] /dev/null )
+    do
+      echo "Processing xml file $xml"
+      xml_indent $xml
+      f=$(basename $xml)
+      if echo "$httpd_xml_files" | grep -q $f ; then
+        echo "$f is defined inside httpd_xml_files"
+      else
+        echo "adding $f on xml_files list"
+        xml_files=$( (for x in $xml_files $f ; do echo $x ; done )| sort -u)
+      fi
+    done
+    #
+    echo "xml_files=$xml_files"
+    echo "httpd_xml_files=$httpd_xml_files"
+    #
+    if [ -z "$xml_files" ]; then
+      if [ -z "$httpd_xml_files" ]; then
+        print_note "WARNING No xml found inside /ericsson/credm/data/xmlfiles or provided as extra directory, skipping processing of $project"
+        print_note "" "ok"
+        print_note "----" "ok"
+        print_note "" "ok"
+        continue
+      fi
+    fi
+  else
+    print_note "WARNING no Dockerfile found on project $project, skipping processing"
+    print_note "" "ok"
+    print_note "----" "ok"
+    print_note "" "ok"
+    continue
+  fi
+  rm -rf container_xmlfiles_extracted 2>/dev/null
+
+  if [ $wait_user == "true" ]; then
+    echo -n "PRESS ENTER TO CONTINUE"
+    read -n 1
+  fi
+  httpd_xml_files=$( (for x in $httpd_xml_files ; do if [ -f $cert_dir/$x ]; then echo $x ; fi ; done )| sort -u)
+  for x in $xml_files
+  do
+    if ! echo "$httpd_xml_files" | grep -q $x; then
+      if ! echo "$xml_files" | grep -q "$x" ; then
+        echo "Adding $x to xml_files"
+        $xml_files="$xml_files $x"
+      fi
+    fi
+  done
+  xml_files=$( (for x in $xml_files ; do echo $x ; done )| sort -u)
+  apache_dockerfile=$(grep -lri eric-enm-sles-apache2)
+  if [ -z "$apache_dockerfile" ]; then
+    echo "No Dockerfile(s) with httpd (eric-enm-sles-apache2)"
+  else
+    for dock in $apache_dockerfile
+    do
+      echo "Processing extra Dockerfile: $dock"
+      fixEofEol $dock
+      envRow=$(grep -n '^ENV ' $dock | head -n 1 | sed 's/:.*//' )
+      if [ -z "$envRow" ]; then
+        envRow=$(grep -n '^COPY ' $dock | head -n 1 | sed 's/:.*//' )
+      fi
+      if [ -z "$envRow" ]; then
+        envRow=$(grep -n '^RUN ' $dock | head -n 1 | sed 's/:.*//' )
+      fi
+      if [ -z "$envRow" ]; then
+        envRow='$'
+      fi
+      echo "patching extra dockerfile"
+      if ! grep 'ENV CREDM_CONTROLLER_MNG="TRUE"' $dock ; then
+        if grep 'ENV.*CREDM_CONTROLLER_MNG' $dock ; then
+	  print_note "WARNING: Found ENV CREDM_CONTROLLER_MNG  inside $dock"
+	  note_line=$(grep "ENV.*CREDM_CONTROLLER_MNG" $dock)
+	  print_note "Line is: $note_line"
+	else
+	  if grep -q '^ENV ' $dock ; then
+	    echo "Inserting ENV CREDM_CONTROLLER_MNG inside file $dock"
+	    sed -i "$envRow i ENV CREDM_CONTROLLER_MNG=\"TRUE\"" $dock
+	  else
+	    echo "Inserting ENV at end of file $dock"
+	    echo "" >> $dock
+	    echo 'ENV CREDM_CONTROLLER_MNG="TRUE"' >> $dock
+	    echo "" >> $dock
+	  fi
+	fi
+      fi
+      echo "patched $dock"
+    done
+  fi
+
+  echo "Unpacking chart files on chart directory $chartDir:"
+  echo ""
+
+  cd $chartDir
+
+  echo "Creating extra directory"
+  mkdir -p appconfig/certificatesdata 2>/dev/null
+  mkdir -p appconfig/initcontainers/waitForCertificatesContainer 2>/dev/null
+  mkdir templates 2>/dev/null
+
+  add_updated_file appconfig/certificatesdata
+
+  file="Chart.yaml"
+  echo "Patching $file"
+
+  fixEofEol $file
+  sed -i "/name: eric-enm-common-helmchart-library/,/version:/s/version:.*/version: $helmchart_library_version/" $file
+  add_updated_file $file
+
+  echo "Inserting requirements (ex requirements.yaml) data inside $file"
+  if ! grep -q "^dependencies:" $file ; then
+    cat <<_EOF_ >> $file
+dependencies:
+_EOF_
+  fi
+  if ! grep -q "eric-enm-common-helmchart-library.enabled" $file ; then
+    cat <<_EOF_ >> $file
+- condition: eric-enm-common-helmchart-library.enabled
+  name: eric-enm-common-helmchart-library
+  repository: https://arm.epk.ericsson.se/artifactory/proj-enm-helm/
+  version: $helmchart_library_version/
+_EOF_
+  else
+    if ! grep -q "^- condition: eric-enm-common-helmchart-library.enabled" $file ; then
+      print_note "NOTE: $file already patched"
+    fi
+  fi
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+
+  file="requirements.yaml"
+  echo "Patching $file"
+
+  if [ -f $file ]; then
+    echo "WARNING $file exist, checking if is already contained inside Chart.yaml (helm3 doesn't need $file) on project $project"
+    echo "Comparing dependencies: section inside Chart.yaml with the requirements.yaml file"
+    add_updated_file $file
+    sed -e '/^dependencies:/p' -e '1,/^dependencies:/d' Chart.yaml > tmp_$$
+    if cmp -s tmp_$$ $file ; then
+      echo "$file already contained inside Chart.yaml removing it form the directory"
+      rm $file
+    else
+      v1=$( grep "version:" tmp_$$ | sed 's/.* *//')
+      v2=$( grep "version:" $file | sed 's/.* *//')
+      sed -i "s/$v2/$v1/" tmp_$$
+      if cmp -s tmp_$$ $file ; then
+        echo "$file already contained inside Chart.yaml removing it form the directory"
+        rm $file
+      else
+        print_note "WARNING $file differ from dependencies: section inside Chart.yaml on project $project"
+        print_note "MANUAL INTERVENTION REQUIRED for $file inside $project"
+      fi
+    fi
+    rm tmp_$$
+  fi
+
+  file="templates/credm-controller-job.yaml";
+  echo "Patching $file"
+
+  if [ ! -f templates/credm-controller-job.yaml ]; then
+    cat <<_EOF_ > $file
+{{- include "eric-enm-common-helmchart-library.credm-controller-job.tpl" . -}}
+_EOF_
+  fi
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+  add_updated_file $file
+
+  file="appconfig/initcontainers/waitForCertificatesContainer/env.yaml";
+  echo "Patching $file"
+
+  if [ ! -f $file ]; then
+    cat <<_EOF_ > $file
+- name: XML_MOUNT_PATH
+  value: {{ .Values.service.xmlMountPath }}
+- name: SERVICE_NAME
+  value: {{ .Values.service.name }}
+_EOF_
+  else
+    fixEofEol $file
+    if ! grep -q "XML_MOUNT_PATH" $file ; then
+      cat <<_EOF_ >> $file
+- name: XML_MOUNT_PATH
+  value: {{ .Values.service.xmlMountPath }}
+_EOF_
+    fi
+    if ! grep -q "SERVICE_NAME" $file ; then
+      cat <<_EOF_ >> $file
+- name: SERVICE_NAME
+  value: {{ .Values.service.name }}
+_EOF_
+    fi
+  fi
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+  add_updated_file $file
+
+  file="appconfig/initcontainers/waitForCertificatesContainer/volumeMounts.yaml"
+
+  num_xml=$(echo "$xml_files" |wc -w)
+  patchVolumeMounts "$file" "" "xml" "$num_xml"
+
+  num_xml=$(echo "$httpd_xml_files" |wc -w)
+  patchVolumeMounts "$file" "httpd" "xmlhttpd" "$num_xml"
+  add_updated_file $file
+
+  file="templates/certificatesecrets.yaml"
+  > $file
+
+  echo "CRL_ENABLE=$crl_enable"
+  patchCertificateSecrets "$file" "" "" "$xml_files"
+  xml_n=$n_xml
+  xml_tls_n=$n_tls
+
+  if [ ! -s $file ]; then
+    if [ "$xml_n" == 0 ] && [ "$xml_tls_n" == "0" ]; then
+      print_note "Empty $file no tls certificates for $project (xml_n=$xml_n, xml_tls_n=$xml_tls_n)"
+    else
+      print_note "NOTE: Empty $file no tls certificates for $project (xml_n=$xml_n, xml_tls_n=$xml_tls_n)"
+    fi
+    rm $file
+  fi
+  add_updated_file $file
+
+  httpd_tls_n=0
+  if [ ! -z "$httpd_xml_files" ]; then
+    file="templates/httpdcertificatesecrets.yaml"
+    > $file
+    echo "CRL_ENABLE=$crl_enable"
+    patchCertificateSecrets "$file" "httpd" '{{ .Files.Get "appconfig/certificatesdata/preProcessingScript-httpd.sh" | quote }}' "$httpd_xml_files"
+    httpd_tls_n=$n_tls
+  fi
+  add_updated_file $file
+
+  file="appconfig/optionalVolumes.yaml"
+  > $file
+
+  num_xml=$(echo "$xml_files" |wc -w)
+  patchOptionalVolumes "$file" "" "$num_xml" "$xml_tls_n"
+
+  file="appconfig/optionalVolumes.yaml"
+  num_xml=$(echo "$httpd_xml_files" |wc -w)
+  patchOptionalVolumes "$file" "httpd" "$num_xml" "$httpd_tls_n"
+
+  add_updated_file $file
+
+  if [ $xml_tls_n -gt 0 ]; then
+    file="appconfig/envvars/env.yaml"
+    echo "Patching $file ($chartDir/$file)"
+
+    fixEofEol $file
+
+    if ! grep -q "^- name: TLS_MOUNT_PATH" $file ; then
+      cat >> $file <<_EOF_ 
+- name: TLS_MOUNT_PATH
+  value: {{ .Values.service.tlsMountPath }}
+_EOF_
+    fi
+    if ! grep -q "^- name: SERVICE_NAME" $file ; then
+      cat >> $file <<_EOF_ 
+- name: SERVICE_NAME
+  value: {{ .Values.service.name }}
+_EOF_
+    fi
+    fixMultiLines $file
+    fixEmptyFirstLastLine $file
+    add_updated_file $file
+  fi
+
+  file="appconfig/volumeMounts.yaml"
+  echo "Patching $file ($chartDir/$file) for $xml_tls_n tls-secret(s)"
+
+  if [ ! -f $file ]; then
+    > $file
+  else
+    sed -i "/tls-secret-/d" $file
+    sed -i "/.Values.service.tlsMountPath/d" $file
+    fixEofEol $file
+  fi
+  add_updated_file $file
+
+  t=1
+  while [ $t -le $xml_tls_n ];
+  do
+    echo "Adding volume for tls-secret-$t"
+    if ! grep -q "tls-secret-$t" $file ; then
+      cat <<_EOF_ >> $file
+- name: tls-secret-$t
+  mountPath: {{ .Values.service.tlsMountPath }}/tls$t
+_EOF_
+    fi
+    t=$(( $t + 1 ))
+  done
+
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+  add_updated_file $file
+
+  if ! grep secret $file ; then
+    print_note "NOTE: no tls-secrets for $project, empty $file"
+  fi
+
+##################
+#
+# httpd 
+#
+  if [ -d appconfig/sidecars/httpd ]; then
+    file="appconfig/sidecars/httpd/volumeMounts.yaml"
+    echo "Patching $file ($chartDir/$file) for $httpd_tls_n httpd-tls-secret(s)"
+
+    if [ ! -f $file ]; then
+      > $file
+    else
+      fixEofEol $file
+      sed -i "/tls-secret-/d" $file
+      sed -i "/.Values.service.tlsMountPath/d" $file
+    fi
+
+    t=1
+    while [ $t -le $httpd_tls_n ];
+    do
+      echo "Adding volume for httpd-tls-secret-$t"
+      if ! grep -q "httpd-tls-secret-$t" $file ; then
+        cat <<_EOF_ >> $file
+- name: httpd-tls-secret-$t
+  mountPath: {{ .Values.service.tlsMountPath }}/tlshttpd$t
+_EOF_
+      fi
+      t=$(( $t + 1 ))
+    done
+    fixMultiLines $file
+    fixEmptyFirstLastLine $file
+    add_updated_file $file
+
+    file="appconfig/sidecars/httpd/env.yaml"
+    echo "Patching $file ($chartDir/$file)"
+
+    fixEofEol $file
+    add_updated_file $file
+
+    if ! grep -q "^- name: TLS_MOUNT_PATH" $file ; then
+      cat >> $file <<_EOF_ 
+- name: TLS_MOUNT_PATH
+  value: {{ .Values.service.tlsMountPath }}
+_EOF_
+    fi
+    if ! grep -q "^- name: SERVICE_NAME" $file ; then
+      cat >> $file <<_EOF_ 
+- name: SERVICE_NAME
+  value: {{ .Values.service.name }}
+_EOF_
+    fi
+    fixMultiLines $file
+    fixEmptyFirstLastLine $file
+  fi
+
+  file="values.yaml"
+  echo "Patching $file ($chartDir/$file)"
+
+  fixEofEol $file
+  add_updated_file $file
+
+  echo "Patching waitForCertificatesContainer on $file ($chartDir/$file)"
+  if ! grep -q waitForCertificatesContainer $file ; then
+    after_images=$(grep '^[^ ]' $file | sed '1,/^images:/d' | head -n 1)
+    if [ -z $after_images ]; then
+            echo "" >> $file
+            echo "_remove_me_" >> $file
+            after_images="_remove_me_"
+    fi
+    echo "Looking for '$after_images' to insert waitForCertificatesContainer section"
+    sed -i "/^$after_images/i \  waitForCertificatesContainer:\n    enabled: true\n    name: enm-wait-for-certificates-container\n    tag: waitForCertificatesContainer_tag\n\n" $file
+    sed -i "/^_remove_me_$/d" $file 
+  else
+    mustExistFile "$file"
+    print_note "waitForCertificatesContainer already present on file $file" "ok"
+  fi
+  print_note "Updating waitForCertificatesContainer tag to: $waitForCertificatesContainer_tag on file $file" "ok"
+  sed -i "/name: enm-wait-for-certificates-container/,/tag:/{s/tag:.*/tag: $waitForCertificatesContainer_tag/}" $file 
+
+  echo "Patching xmlMountPath on $file ($chartDir/$file)"
+  if ! grep -q "xmlMountPath:" $file ; then
+    sed -i 's,\(  *\)labels: *{},\1labels:\n\1xmlMountPath: "_xml_mount_path_"\n\1tlsMountPath: "_tls_mount_path_"\n\n,' $file 
+    sed -i "s,_xml_mount_path_,$xmlMountPath," $file 
+    sed -i "s,_tls_mount_path_,$tlsMountPath," $file 
+  else
+    mustExistFile "$file"
+    print_note "WARNING: $file already patched on project $project"
+  fi
+
+  echo "Patching enm-certrequestjob-container on $file ($chartDir/$file)"
+  fixEofEol $file
+  add_updated_file $file
+
+  if ! grep -q "^credmController" $file ; then
+    cat >> $file <<_EOF_ 
+
+credmController:
+  name: eric-enm-credm-controller
+  port: 5001
+_EOF_
+  fi
+
+  if ! grep -q "^jobs:" $file ; then
+    cat >> $file <<_EOF_ 
+
+jobs:
+_EOF_
+  fi
+  if ! grep -q 'imageName: enm-certrequestjob-container' $file ; then
+      echo "PATCHING enm-certrequestjob-container"
+      sed -i -e '/^jobs:/a \
+  jobAction: certrequest\
+  certRequest:\
+    imageName: enm-certrequestjob-container\
+    pullPolicy: Always\
+    tag: certreqjob_version\
+    resources:\
+      requests:\
+        enabled: true\
+        cpu: 500m\
+        memory: 512Mi\
+      limits:\
+        enabled: true\
+        cpu: 1000m\
+        memory: 512Mi
+' $file
+  else
+    mustExistFile "$file"
+    print_note "WARNING: enm-certrequestjob-container on $file found for project $project. Patching tag to: $certreqjob_version"
+  fi
+  sed -i "/imageName: enm-certrequestjob-container/,/tag: /{s/tag: .*/tag: $certreqjob_version/}" $file
+
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+
+  valuesTlsMountPath=$(grep "tlsMountPath:" $file | sed -e 's/.*://' -e 's/ //g' -e 's/"//g' -e "s/'//g")
+
+  cd $here/$project
+  echo "Patching on directory: "$(pwd)
+
+  mkdir image_content 2> /dev/null
+
+  file="image_content/enmCertificatesLocal.sh"
+  echo "Patching $file"
+
+  if [ -f $file ]; then
+    rm -f $file
+    print_note "WARNING $file found on $project is it never patched?"
+  fi
+  add_updated_file $file
+
+  for fn in $( grep -rl enmCertificatesLocal.sh image_content )
+  do
+    file="$fn"
+    echo "Patching $file"
+    if grep -q '/opt/ericsson/ERICcredentialmanagercli/bin/enmCertificatesLocal.sh' $file ; then
+      print_note "WARNING: changing /opt/ericsson/ERICcredentialmanagercli/bin/enmCertificatesLocal.sh to /usr/bin/date inside $file"
+      sed -i 's,/opt/ericsson/ERICcredentialmanagercli/bin/enmCertificatesLocal.sh,/usr/bin/date,g' $file
+    fi
+    if grep -q 'enmCertificatesLocal.sh' $file ; then
+      str=$(grep -n 'enmCertificatesLocal.sh' $file)
+      print_note "WARNING!!!: changing extra reference to enmCertificatesLocal.sh to /usr/bin/date inside $file for lines:\n$str"
+      sed -i 's,enmCertificatesLocal.sh,/usr/bin/date,g' $file
+    fi
+  done
+
+  file="image_content/create_service_certificates.sh"
+  echo "Patching $file"
+
+  if [ -f $file ]; then
+    print_note "Removing $file"
+    rm -f $file
+  fi
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+  add_updated_file $file
+
+  file="$dockerfile"
+  echo "Patching $file"
+
+  fixEofEol $file
+  add_updated_file $file
+  if ! grep -q 'No ERICcredentialmanagercli_CXP9031389' $file ; then
+    if grep -q ERICcredentialmanagercli_CXP9031389 $file ; then
+      sed -i -e 's/ERICcredentialmanagercli_CXP9031389//g' $file
+      sed -i -e '/^  *\\ *$/d' $file
+      sed -i -e '/^#  *\\ *$/d' $file
+      sed -i -e 's/  *\\$/ \\' $file
+    else
+      print_note "NOTE no ERICcredentialmanagercli_CXP9031389 inside found $file inside $project or already patched"
+    fi
+  fi
+
+  #
+  # Remove COPY create_service_certificates.sh command
+  #
+  if grep -q 'create_service_certificates.sh' $file ; then
+    sed -i '/COPY.*create_service_certificates.sh/d' $file
+    sed -i '/RUN.*create_service_certificates.sh/d' $file
+  fi
+  #
+  # Add COPY command
+  #
+  copy_cmd="COPY image_content/createCertificatesLinks.sh /ericsson/3pp/jboss/bin/pre-start/createCertificatesLinks.sh"
+  first_copy=$(grep -n '^COPY' $file| head -n 1 | sed 's/:.*//')
+  if [ -z "$first_copy" ]; then
+    first_copy='$'
+  fi
+  if ! grep -q 'createCertificatesLinks.sh' $file ; then
+    if grep -q '^COPY.*enmCertificatesLocal.sh' $file ; then
+      sed_cmd="s;^COPY.*enmCertificatesLocal.sh.*;$copy_cmd;"
+    else
+      sed_cmd="$first_copy i $copy_cmd"
+    fi
+    sed -i "$sed_cmd" $file
+    sed -i '/^COPY image_content.createCertificatesLinks.sh/a \
+RUN /bin/chown jboss_user:jboss /ericsson/3pp/jboss/bin/pre-start/createCertificatesLinks.sh\
+RUN /bin/chmod 755 /ericsson/3pp/jboss/bin/pre-start/createCertificatesLinks.sh\
+\
+RUN /bin/mkdir -p /ericsson/credm/data/certs && \\\
+    /bin/chown -R jboss_user:jboss /ericsson/credm/data/certs && \\\
+    /bin/chmod -R 755 /ericsson/credm/data/certs \
+\
+####_extra_dir_
+' $file
+
+    cert_dirs_unique=$( ( for cp in $cert_dir_list ; do echo "$cp" ; done ) | sort -u )
+    echo "cert_list=$cert_dirs_unique"
+    for cp in $cert_dirs_unique
+    do
+      echo "Adding $cp on $file"
+      sed -i -e '/^####_extra_dir_/i RUN /bin/mkdir -p _cert_path_ && \\\
+    /bin/chown -R jboss_user:jboss _cert_path_ && \\\
+    /bin/chmod -R 755 _cert_path_\\\
+####_extra_dir_
+' -e "s/_cert_path_/$cp/" $file
+    done
+    sed -i '/^####_extra_dir_/d' $file
+  else
+    print_note "WARNING: createCertificatesLinks.sh found inside $file on project $project"
+  fi
+  if [ $vmRestart == true ]; then
+    echo "Apply FIX for TORF-537452 on $project $file"
+    if ! grep "TORF-537452" $file ; then
+      sed -i '/^COPY image_content.createCertificatesLinks.sh/a \
+# TORF-537452 : TEMP to remove when script that restarts mediation PODS in CIS-149159 will be fixed\
+COPY image_content/credentialmanagercliRestartVM.sh /usr/lib/ocf/resource.d/credentialmanagercliRestartVM.sh\
+RUN mkdir -p -m 777 /opt/ericsson/ERICcredentialmanagercli && chmod 755 /usr/lib/ocf/resource.d/credentialmanagercliRestartVM.sh\
+\
+' $file
+    fi
+  else
+    if grep "TORF-537452" $file ; then
+      print_note "Removing FIX for TORF-537452 on $project $file"
+      sed -i '/credentialmanagercliRestartVM.sh/d' $file
+      sed -i '/TORF-537452/d' $file
+    fi
+  fi
+  #
+  if [ $crl_add == "true" ]; then
+    if ! grep "/usr/lib/ocf/resource.d/updateCRL.sh" $file ; then
+      sed -i '/^COPY image_content.createCertificatesLinks.sh/a \
+\
+COPY image_content/updateCRL.sh /usr/lib/ocf/resource.d/updateCRL.sh\
+RUN /bin/chmod 755 /usr/lib/ocf/resource.d/updateCRL.sh\
+\
+' $file
+    fi
+  fi
+  #
+  if ! grep "resource.d/updateCertificatesLinks.sh" $file ; then
+    sed -i '/^COPY image_content.createCertificatesLinks.sh/a \
+\
+COPY image_content/updateCertificatesLinks.sh /usr/lib/ocf/resource.d/updateCertificatesLinks.sh\
+RUN /bin/chmod 755 /usr/lib/ocf/resource.d/updateCertificatesLinks.sh\
+\
+' $file
+  fi
+  #
+  # Remove references to enmCertificatesLocal.sh
+  #
+  if grep -q '/opt/ericsson/ERICcredentialmanagercli/bin/enmCertificatesLocal.sh' $file ; then
+    sed -i 's,/opt/ericsson/ERICcredentialmanagercli/bin/enmCertificatesLocal.sh,/usr/bin/date,g' $file
+  fi
+
+  #
+  # Remove ERICcredentialmanagercli_CXP9031389 if it's
+  # already installed on the container
+  #
+  last_run=$(sed -n '/^RUN/=' $file| sed -e '$!d')
+  if [ -z "$last_run" ]; then last_run='$' ; fi
+  if ! grep "No ERICcredentialmanagercli_CXP9031389" $file ; then
+    sed -i "$last_run i RUN if rpm -e --nodeps ERICcredentialmanagercli_CXP9031389 ; then echo 'Removed ERICcredentialmanagercli_CXP9031389 from $project' ; else echo 'No ERICcredentialmanagercli_CXP9031389 installed inside $project' ; fi" $file
+  fi
+
+  fixMultiLines $file
+  fixEmptyFirstLastLine $file
+  add_updated_file $file
+
+  echo ""
+
+  echo "Adding files on current directory:"
+
+  echo ""
+
+  this_dir=$(pwd)
+  file="./image_content/createCertificatesLinks.sh"
+  echo "Patching $file (creating)"
+  add_updated_file $file
+
+  inside_temp=false
+  if [ -f $file ]; then
+    mkdir tmp_dir_$$
+    cd tmp_dir_$$
+    inside_temp=true
+  fi
+  cat <<_EOF_ | base64 -d | tar xzvf -
+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
+_EOF_
+  if [ $inside_temp == true ]; then
+    for f in image_content/*
+    do
+      fb=$(basename $f)
+      if [ ! -f ../image_content/$fb ]; then
+        cp $f ../image_content/
+      else
+        if ! cmp -s $f ../image_content/$fb ; then
+          tmp_dir=$(pwd)
+          print_note "WARNIG $this_dir/$f differs from $tmp_dir/$f (script one), using new one"
+          echo cp -f $f ../image_content/$fb
+          cp -f $f ../image_content/$fb
+        fi
+      fi
+    done
+  fi
+
+  cd $this_dir
+  rm -rf $tmp_dir
+
+  file="$dockerfile"
+  echo "Check if need to remove ERICcredentialmanagercli_CXP9031389 from $file"
+  cp $file $file.tmp
+  echo "Building image using: docker $docker_build -f ${file}.tmp --network=host -t \"$project:tmp\""
+  if docker $docker_build -f ${file}.tmp --network=host -t "$project:tmp" . | grep -q '^No ERICcredentialmanagercli_CXP9031389' ; then
+    print_note "$dockerfile does not requires removal of ERICcredentialmanagercli_CXP9031389"
+    sed -i '/No ERICcredentialmanagercli_CXP9031389 installed inside/d' $file
+  else
+    print_note "$dockerfile requires removal of ERICcredentialmanagercli_CXP9031389"
+  fi
+  rm $file.tmp
+
+  file="./image_content/updateCertificatesLinks.sh"
+  echo "Patching $file"
+
+  if [ $crl_add == "false" ];then
+    rm ./image_content/updateCRL.sh 2>/dev/null
+  fi
+  if [ ! -f $chartDir/templates/certificatesecrets.yaml ]; then
+    print_note "No certificates, restoring original $dockerfile"
+    rm ./image_content/updateCertificatesLinks.sh 2>/dev/null
+    rm ./image_content/createCertificatesLinks.sh 2>/dev/null
+    rm ./image_content/updateCRL.sh 2>/dev/null
+    rm ./image_content/credentialmanagercliRestartVM.sh 2>/dev/null
+    cp ../$project.beforePatch/$dockerfile $dockerfile
+  else
+    add_updated_file $file
+    script_list=$(echo $cert_script_list)
+    echo " changing runscript_list=\"\" to ,runscript_list=\"$script_list\""
+    sed -i "s;runscript_list=.*;runscript_list=\"$script_list\";" $file
+    sed -i "s,^DEFAULT_TLS_MOUNT_PATH=.*,DEFAULT_TLS_MOUNT_PATH='$valuesTlsMountPath'," $file
+
+    file="./image_content/createCertificatesLinks.sh"
+    add_updated_file $file
+
+    file="./image_content/updateCRL.sh"
+    add_updated_file $file
+
+    file="./image_content/credentialmanagercliRestartVM.sh"
+    add_updated_file $file
+  fi
+
+  file="./image_content/createCertificatesLinks.sh"
+  echo "Patching $file"
+  if [ -f $file ]; then
+    add_updated_file $file
+    sed -i "s,^DEFAULT_TLS_MOUNT_PATH=.*,DEFAULT_TLS_MOUNT_PATH='$valuesTlsMountPath'," $file
+  fi
+
+  cd $this_dir
+
+  if [ $vmRestart != true ]; then
+    rm -f image_content/credentialmanagercliRestartVM.sh 2> /dev/null
+  fi
+
+  if rmdir image_content 2>/dev/null ; then
+    echo "Removing empty directory image_content"
+  fi
+
+  if [ "$check" == "false" ]; then
+    #
+    # Creating testCloud version
+    #
+    rm -rf ../$project.testCloud 2> /dev/null
+    mkdir ../$project.testCloud
+    cp -R . ../$project.testCloud
+
+    #
+    # Creating localTest version
+    #
+    rm -rf ../$project.localTest 2> /dev/null
+    mkdir ../$project.localTest
+    cp -R . ../$project.localTest/
+
+    #
+    # Git add all new files
+    #
+
+    echo "Git status for $project"
+
+    commit_msg="[NOJIRA] [Credential Manager on cENM] Certificate distribution on Application: $project"
+    torf_link="https://jira-oss.seli.wh.rnd.internal.ericsson.com/browse/TORF-XXXXXX"
+    for l in $torf_list
+    do
+      pn=$( echo "$l" | sed 's/;.*//' );
+      p=$( echo "$l" | sed 's/.*;\(.*\),.*/\1/' );
+      lnk=$( echo "$l" | sed 's/.*,//' );
+      trf=$( echo "$l" | sed 's,.*/,,' );
+      if [ "$project" == "$p" ]; then
+	torf=$trf
+	torf_link=$lnk
+	commit_msg="[$torf] [Credential Manager on cENM] Certificate distribution on Application: $project
+
+   $torf_link
+
+      Using the centralized credential manager, removing the local one from service group $pn.
+  ";
+	break;
+      fi
+    done
+
+    if [ -d .git ]; then
+      git status
+
+      echo "adding files"
+      for f in $updated_files
+      do
+	if [ -f $f ]; then
+	  git add $f
+	else
+	  if [ -d $f ]; then
+	    git add $f
+	  fi
+	fi
+      done
+      if [ -d image_content ]; then
+	git add image_content/
+      fi
+
+      echo "Git status for $project after add"
+      git status
+
+      echo "Commit msg for $project: $commit_msg"
+      git commit -a -m "$commit_msg"
+
+      echo "Commit log fot $project:"
+      git log -n 1
+
+    fi
+
+    file="$chartDir/values.yaml"
+    after_images=$(expand $file | grep '^[^ ]' | sed '1,/^images:/d' | head -n 1)
+    if [ -z "$after_images" ]; then
+      after_images="_delete_lines_from_here_"
+    fi
+    images=$( expand $file | sed -e '1,/^images:/d' -e "/^$after_images/,\$ d" | \
+	    grep -E '^  *name:|^  *tag:' | sed '/^  *name:/N;s/\n//' | sed -e 's/tag:/,/' -e 's/name://' -e 's/ *//g' | grep -Ev "VERSION" )
+    images_proj=$( expand $file | sed -e '1,/^images:/d' -e "/^$after_images/,\$ d" | \
+	    sed 's/  *$//' | grep -E '^  [a-zA-Z].*:$|^  *name:|^  *tag:' | sed '/^  *name:/N;s/\n//' | sed '/^  [a-zA-Z].*:/N;s/\n//' | sed -e 's/tag:/,/' -e 's/name://' -e 's/ *//g' | grep -E "VERSION" )
+    after_jobs=$(expand $file | grep '^[^ ]' | sed '1,/^jobs:/d' | head -n 1)
+    if [ -z "$after_jobs" ]; then
+      after_jobs="_delete_lines_from_here_"
+    fi
+    images_extra=$( expand $file | sed -e '1,/^images:/d' -e "/^$after_jobs/,\$ d" | sed '1,/^jobs:/d' | \
+	    grep -E "^  *imageName:|^  *tag:" | sed '/^  *imageName:/N;s/\n//' | sed -e 's/.*imageName://' | sed -e 's/tag:/,/' -e 's/ *//g' )
+    images="$images $images_extra"
+
+    replicas=$(grep "replicas-$project:" $file | sed "s,:.*,: 1,")
+
+    #
+    # Patch localTest
+    #
+    echo "Patch specific for local tests"
+    cd $here/$project.localTest/
+
+    file="localEnv.yaml"
+    echo "Creating file $file"
+
+    cat > $file <<_EOF_
+#
+# Local ENvironment (MINIKUBE) mode
+localEnv:
+  enabled: true
+ 
+livenessProbe:
+  enabled: false
+ 
+readinessProbe:
+  enabled: false
+ 
+startupProbe:
+  enabled: false
+ 
+images:
+_EOF_
+    for img in $images_proj
+    do
+      image_name=$(echo $img | sed 's/:.*//')
+      image_img=$(echo $img | sed 's/.*://' | sed 's/,.*//')
+  cat >> $file <<_EOF_
+  $image_name:
+    name: $image_img
+    tag: $tag
+
+_EOF_
+    done
+    cat >> $file <<_EOF_
+  waitInitContainer:
+    enabled: false
+
+global:
+  ingress:
+    enmHost: "localhost.local"
+
+spec:
+  hostAliases:
+  - ip: "127.0.0.1"
+    hostnames:
+    - "localhost.local"
+
+imageCredentials:
+  pullPolicy: Never
+
+jobs:
+  certRequest:
+    pullPolicy: Never
+    tag: latest
+
+$replicas
+_EOF_
+    fixMultiLines $file
+    fixEmptyFirstLastLine $file
+
+    file="build_project_and_get_images.sh"
+    echo "Creating build_project_and_get_images.sh for $project local tests"
+
+    cat > $file <<_EOF_
+#!/bin/bash
+#
+# Run this script to download needed images and build the project
+#
+cloud_repo=$cloud_repo
+#
+# List of needed images
+#
+_EOF_
+
+    # Writing images list
+    echo 'images="' >> $file
+    for img in $images
+    do
+      echo "$img" >> $file
+    done
+    echo '"' >> $file
+
+    cat >> $file <<_EOF_
+
+for i in \$images
+do
+  image_name=\$(echo "\$i" | sed "s/,.*//" )
+  image_tag=\$(echo "\$i" | sed "s/.*,//" )
+  if [ "\$image_name" != "$project" ]; then
+    if docker pull $cloud_repo/\$image_name:\$image_tag > /dev/null 2>&1 ; then
+      echo "image pulled ok"
+    else
+      echo "WARING: required image $cloud_repo/\$image_name:\$image_tag not found for project $project build it manually or try re-tag latest one"
+    fi
+  fi
+done
+_EOF_
+
+    echo "Building image $cloud_repo/$project:$tag on current directory"
+    cat >> $file <<_EOF_
+for dfile in \$(find . | grep -i dockerfile)
+do
+  prj_dir=\$(dirname \$dfile)
+  prj=\$(basename \$prj_dir)
+  if [ \$prj = "." ]; then
+    prj="$project"
+    if [ -f \${prj_dir}/buildah__generate_images.sh ]; then
+      echo "$tag" > VERSION_PREFIX
+      if grep -q VERSION_PREFIX \$dfile ; then
+	echo "Building using buildah__generate_images.sh"
+	(cd \$prj_dir ; ./buildah__generate_images.sh)
+      else
+	echo "WARNING: Don't know how to build image $project with tag $tag"
+	echo "Will try to build image using 'docker $docker_build'"
+	docker $docker_build --network=host -t $cloud_repo/\$prj:$tag \$prj_dir
+      fi
+    else
+      docker $docker_build --network=host -t $cloud_repo/\$prj:$tag \$prj_dir
+    fi
+  else
+    docker $docker_build --network=host -t $cloud_repo/\$prj:$tag \$prj_dir
+  fi
+done
+_EOF_
+    chmod a+x $file
+
+    cd $chartDir
+
+    #  Controllare che tutti i volumi di tipo persistentVolumeClaim dentro chart/eric-enmsg-*/appconfig/volumes.yaml
+    #  siano elencati dentro chart/eric-enmsg-*/templates/localEnv-pvc.yaml aggiungendo al nome il prefisso: "eric-enm-rwxpvc-"
+    #  inseribile nello script facilmente cercando claimName: _nome_ e creando per ciascun nome una sezione
+
+    file="templates/localEnv-pvc.yaml"
+    echo "Creating $file"
+
+    > $file
+    vol_n=0
+    volumes=$(grep claimName appconfig/volumes.yaml | sed -e 's/.*claimName://' -e 's/ *//g')
+    for vol in $volumes
+    do
+      vol_n=$((vol_n + 1))
+      if [ $vol_n != "1" ]; then
+	echo "---" >> $file
+      fi
+      cat <<_EOF_ >> $file
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: eric-enm-rwxpvc-$vol
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+_EOF_
+    done
+    fixMultiLines $file
+    fixEmptyFirstLastLine $file
+
+    #
+    # Patch testCloud
+    #
+    echo "Patch specific for Cloud tests"
+    cd $here/$project.testCloud/
+
+    file="push_cloud_images.sh"
+
+    cat > $file <<_EOF_
+#!/bin/bash
+#
+# Run this script to download needed images and push it on cloud staging repository
+#
+cloud_repo=$cloud_repo
+cloud_staging_repo=$cloud_repo
+#
+# List of needed images
+#
+_EOF_
+
+    # Writing images list
+    echo 'images="' >> $file
+    for img in $images
+    do
+      echo "$img" >> $file
+    done
+    echo '"' >> $file
+
+    cat >> $file <<_EOF_
+
+for i in \$images
+do
+  image_name=\$(echo "\$i" | sed "s/,.*//" )
+  image_tag=\$(echo "\$i" | sed "s/.*,//" )
+  if [ "\$image_name" != "$project" ]; then
+    if [ "\$image_tag" == "latest" ]; then
+      echo "WARNING: \$image_name has 'latest' as tag. You have tu pull it manually and push it with a some unique tag"
+    else
+      if docker pull $cloud_repo/\$image_name:\$image_tag > /dev/null 2>&1 ; then
+	if docker pull $cloud_staging_repo/\$image_name:\$image_tag > /dev/null 2>&1 ; then
+	  echo "image \$image_name:\$image_tag already pushed on repo"
+	else
+	  docker tag $cloud_repo/\$image_name:\$image_tag $cloud_staging_repo/\$image_name:\$image_tag
+	  if docker push $cloud_staging_repo/\$image_name:\$image_tag ; then
+	    echo "Image $cloud_repo/\$image_name:\$image_tag $cloud_staging_repo/\$image_name:\$image_tag pushed ok"
+	  else
+	    echo "WARNING: push failed, did you forgot to do docker login with key saved on \$HOME/.docker/config.json ?"
+	  fi 
+	fi
+      else
+	echo "WARNING: required image $cloud_repo/\$image_name:\$image_tag not found for project $project"
+      fi
+    fi
+  fi
+done
+_EOF_
+
+    cat >> $file <<_EOF_
+  tag="$tag"
+(cd chart ; tar zcf ../$project.tgz $project)
+echo "Copy $project.tgz to the Cloud environment and replace the content of $project inside the helm structure with the one inside the tgz"
+_EOF_
+
+    echo "Building image $cloud_repo/$project:$tag on current directory"
+    cat >> $file <<_EOF_
+for dfile in \$(find . | grep -i dockerfile)
+do
+  prj_dir=\$(dirname \$dfile)
+  prj=\$(basename \$prj_dir)
+  if [ \$prj = "." ]; then
+    prj="$project"
+  fi
+  echo "Building: \$prj:\$tag"
+  if [ -f \$prj_dir/buildah__generate_images.sh ]; then
+    if grep "$docker_repo" \$prj_dir/buildah__generate_images.sh ; then
+      sed -i "s/image_version=.*/image_version=\$tag/" \$prj_dir/buildah__generate_images.sh
+      sed -i "s,image_path=.*,image_path=$cloud_staging_repo/\${image_name}," \$prj_dir/buildah__generate_images.sh
+      chmod a+x \$prj_dir/buildah__generate_images.sh
+      (cd \$prj_dir ; ./buildah__generate_images.sh)
+    else
+      echo -n "ERROR missing $cloud_staging_repo inside \$prj_dir/buildah__generate_images.sh"
+    fi
+  else
+    docker $docker_build -t $cloud_staging_repo/\$prj:\$tag \$prj_dir
+    echo "Push: $cloud_staging_repo/\$prj:\$tag"
+    docker push $cloud_staging_repo/\$prj:\$tag
+  fi
+  echo -n "Check manifest date on https://$cloud_staging_repo/\$prj:\$tag:  "
+  wget "https://$cloud_staging_repo_path/\$prj/\$tag/" -O - 2>/dev/null |grep '"manifest.json"' |expand | awk '{print \$3" " \$4}'
+done
+_EOF_
+
+    chmod a+x $file
+
+    cd $chartDir
+
+    file="values.yaml"
+    mustExistFile "$file"
+
+    if grep -q "postgres_service:" $file ; then
+      sed -i 's/postgres_service: *$/postgres_service: postgres/' $file 
+    fi
+
+    sed -i "/$project:/,/tag:/s/tag:.*/tag: $tag/1" $file
+    sed -i "/tag: VERSION/ s/tag:.*/tag: $tag/1" $file
+
+    fixMultiLines $file
+    fixEmptyFirstLastLine $file
+
+    if grep -q "repoPath:" $file ; then
+      sed -i 's,repoPath:.*,repoPath: proj_oss_releases/enm,' $file
+    else
+      print_note "WARNING: missing repoPath: inside $file (project: $project)"
+    fi
+
+    #
+    # Back to projects collection direcory
+    #
+    cd $here
+
+    (
+      cd $project/$chartDir
+      helm dep update .
+      rm -f Chart.lock
+      rm -rf charts/
+    )
+
+    (
+      cd $project.testCloud/$chartDir
+      helm dep update .
+      rm -rf Chart.lock
+      rm -rf charts/
+    )
+
+    ( cd $project.localTest/$chartDir ; helm dep update . )
+
+  else
+    cd $here
+    print_note "Checking differences on xml files"
+    xml_changed=$(diff -wBr ${project}/chart/$project/appconfig/certificatesdata  ${project}.beforePatch/chart/$project/appconfig/certificatesdata |grep '^diff -wBr' | grep 'xml$'  | sed 's/^diff -wBr //' | sed 's/ .*//')
+    xml_added_or_removed=$(diff -wBr ${project}/chart/$project/appconfig/certificatesdata  ${project}.beforePatch/chart/$project/appconfig/certificatesdata |grep "^Only in CENM.*$project" | grep 'xml$'  | sed 's,.*/certificatesdata: ,,')
+    diffs="false"
+    for xx in $xml_changed
+    do
+      print_note "WARNING: $xx has changed in project $project"
+      diffs="true"
+    done
+    for xx in $xml_added_or_removed
+    do
+      if [ -f ${project}/chart/$project/appconfig/certificatesdata/$xx ]; then
+        print_note "WARNING: $xx has been added in project $project"
+      else
+        print_note "WARNING: $xx has been removed in project $project"
+      fi
+      diffs="true"
+    done
+    if [ "$diffs" == "true" ]; then
+      print_note "WORKAROUND:  run the script 'run_update_credm_info -crl $project' to generate an updated project directory"
+      print_note "HINT: consult confluence page https://confluence-oss.seli.wh.rnd.internal.ericsson.com/display/ENMCOMECIM/Script+automation+for+Credential+Manager+introduction+on+cENM+service+group"
+    fi
+  fi
+
+  if [ $note == false ]; then
+    print_note "$project patched ok" "ok"
+  else
+    print_note "$project patched with some note" "ok"
+  fi
+  print_note "" "ok"
+  print_note "" "ok"
+
+done
+#

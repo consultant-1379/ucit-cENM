@@ -1,0 +1,7 @@
+delete_entity.sh         The readable shell script
+create_delete_entity.sh  Create a compiled executable with limited time validity, that will delete only fixed (compiled) entity.
+recreate_delete.sh       Will call create_delete_entity.sh on all local "delete_entity_*_from_db" executables using default expiration (10 days)
+MANIFEST.txt             This file
+README.txt               Explanation
+ENM_PKI_ROOT_SWAP.sh     Script to swap active certificate to inactive and inactive certificate to active
+create_enm_swap_cert.sh  Compile ENM_PKI_ROOT_SWAP.sh to a binary with expiration time

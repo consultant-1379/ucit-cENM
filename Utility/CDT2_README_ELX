@@ -1,0 +1,81 @@
+#
+# Commands to install all needed tools on Linux(ELX) machines
+# Should work also on other distributions (e.g. RHEL and SLES)
+# 
+#  Tested on:
+#   ELX (Ubuntu 20.04)
+#   RHEL 7.9
+#   ENM IDE (SLES 15.4)
+#
+# Is it possible to source this command with:
+#
+# . README_ELX
+#
+# NOTE: if already present other release remove it using nvm uninstall
+#       In some cases could benecessary to remove all old installed nodes inside $HOME/.nvm directory (rm -rf $HOME/.nvm)
+#
+# Here install nvm version 0.39.1 (should work also greater versions)
+#
+#
+#
+#
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.1/install.sh | bash
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+#
+if grep NVM_DIR $HOME/.bashrc ; then
+  echo "NVM Already on .bashrc"
+  echo "Check if is as expected"
+else
+  cat <<_EOF_ >> $HOME/.bashrc
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+_EOF_
+fi
+#
+# MANDATORY versions: node v12.6.0 (that bring npm 6.9.0)
+#
+nvm install v12.6.0
+#
+# Check versions:
+#
+node_version=$(node -v)
+if echo "$node_version" | grep "v12.6.0" ; then
+  echo "Node version is OK"
+else
+  echo "Wrong NODE version: $node_version"
+  return
+fi
+#
+npm_version=$(npm -v)
+if echo "$npm_version" | grep "6.9.0" ; then
+  echo "NPM version is OK"
+else
+  echo "Wrong NPM version: $node_version"
+  return
+fi
+#
+# CDT2 Setup
+#
+npm config set @uisdk:registry https://arm.seli.gic.ericsson.se/artifactory/api/npm/proj-uisdk-npm-local/
+npm install -g @uisdk/cdt2 --ignore-scripts
+cdt2 self-update
+npm install request
+npm install required
+npm install -g @uisdk/phantomjs-bin
+cdt2 self-update
+#
+#  Commands to run Maven on current project using the installed tools (node, npm, cdt2, phantomjs)
+#
+cat <<_EOF_
+To run maven on this project run:
+
+mvn clean install -DnodeDir=$HOME/.nvm/versions/node/v12.6.0
+
+
+To run maven skipping tests:
+
+mvn clean install -DnodeDir=$HOME/.nvm/versions/node/v12.6.0 -Dphase=package-notest
+_EOF_

@@ -1,0 +1,138 @@
+#!/bin/bash
+#
+#*******************************************************************************
+# Version 1.0
+# COPYRIGHT Ericsson 2022
+#
+# The copyright to the computer program(s) herein is the property of
+# Ericsson Inc. The programs may be used and/or copied only with written
+# permission from Ericsson Inc. or in accordance with the terms and
+# conditions stipulated in the agreement/contract under which the
+# program(s) have been supplied.
+#********************************************************************************
+#
+# Purpose: Will run related script downloading it from gerrit
+#          using project ucit-cENM from: ssh://gerrit.ericsson.se:29418/OSS/ENM-Parent/SQ-Gate/com.ericsson.oss.containerisation/ucit-cENM
+#          using project ucit-cENM from: ssh://gerrit-gamma.gic.ericsson.se:29418/OSS/ENM-Parent/SQ-Gate/com.ericsson.oss.containerisation/ucit-cENM
+#
+#********************************************************************************
+#
+# Changing diretory CurrentDir (useful for Docker Environment)
+#
+if [ -d CurrentDir ]; then
+  cd CurrentDir
+fi
+#
+# Get the username to connect the git repository (assumes is same as local user)
+#
+if [ -z "$USER" ]; then
+  USER=$(whoami)
+fi
+#
+user=$USER
+#
+export RUN_SCRIPT=$0
+#
+reponame="ucit-cENM"
+#
+REPO="ssh://$user@gerrit.ericsson.se:29418/OSS/ENM-Parent/SQ-Gate/com.ericsson.oss.containerisation/$reponame"
+REPO="ssh://$user@gerrit-gamma.gic.ericsson.se:29418/OSS/ENM-Parent/SQ-Gate/com.ericsson.oss.containerisation/$reponame"
+#
+script_dir=$(dirname $0)
+script_name=$(basename $0 | sed -e 's/^run_//' -e 's/_debug//' )
+debug=$(basename $0 | sed -e 's/.*_debug/true/' )
+#
+cmdName=$0
+#
+usage() {
+  if ! echo "$cmdName" | grep -q -e '^run_' ; then
+    echo "$cmdName is a launcher and should be used by symbolic link or renamed as run_desired_script_name. As alternative the --script-name option is available."
+  fi
+  echo "Usage: $cmdname --script-name desired_script_name_to_run [--script-debug] [desired script options]"
+  echo "  --script-name desired_script_name_to_run        This is a mandatory option if not using rhe run_.....   'trick'"
+  echo "  --script-debug                                  set the DEBUG environment variable to 'true'"
+  echo "                                                  Is it possible to use _debug suffix to the script name to have DEBUG=true (default=false)"
+  echo "  if DEBUG is true the downloaded repository will not be removed when the script ends"
+  exit
+}
+#
+if [ "$debug" == "true" ]; then
+  export DEBUG="true"
+else
+  export DEBUG="false"
+  debug="false"
+fi
+#
+if [ "x$1" == "x--script-name" ]; then
+  shift
+  script_name="$1"
+  shift
+fi
+#
+if [ "x$1" == "x--script-debug" ]; then
+  shift
+  debug="true"
+  export DEBUG="true"
+fi
+#
+if [ "$debug" == "true" ]; then
+  remove="no"
+else
+  remove="yes"
+fi
+#
+if [ -z "" ]; then
+  usage
+fi
+#
+if [ -z "$REPODIR" ]; then
+  tmp_repodir=$(pwd)"/tmp_repo"
+  if [ -f $tmp_repodir/RunTool/runTool ]; then
+    if [ -f $script_dir/runTool ]; then
+      cp $script_dir/runTool $script_dir/runTool.sav
+      cp $tmp_repodir/RunTool/runTool $script_dir/runTool
+      cp $script_dir/dockerRunTool $script_dir/dockerRunTool.sav
+      cp $tmp_repodir/dockerRunTool $script_dir/dockerRunTool
+    fi
+  fi
+else
+  tmp_repodir="$REPODIR"
+  remove="no"
+fi
+#
+export REPODIR="$tmp_repodir"
+#
+if [ ! -d $tmp_repodir/$reponame/.git ]; then
+  rm -rf $tmp_repodir 2>/dev/null
+  ( mkdir $tmp_repodir 2>/dev/null
+    cd $tmp_repodir >/dev/null 2>&1
+    echo "REPODIR=$REPODIR"
+    echo "Cloning $REPO"
+    git clone $REPO
+  )
+else
+  git pull
+fi
+#
+script=$( find $tmp_repodir -name "$script_name" )
+#
+if [ -z "$script" ]; then
+  echo "ERROR: Can't find $script_name from $REPO"
+  exit 1
+fi
+#
+# Finally run the script
+#
+if [ "$debug" == "true" ]; then
+  echo "RUN_SCRIPT:"$(printenv RUN_SCRIPT)
+fi
+$script $*
+#
+ret=$?
+#
+if [ "$remove" == "yes" ]; then
+  rm -rf $tmp_repodir 2>/dev/null
+fi
+#
+exit $ret
+#

@@ -1,0 +1,5 @@
+MANIFEST.txt            This file
+README.txt              Explanation
+query_entity_crlinfo.sh Query crlinfo table for NE_OAM_CA
+query_entity_cert.sh    Query the certificates associated at each entity
+create_delete_entity.sh Create a compiled executable with limited time validity, that will delete only fixed (compiled) entity.

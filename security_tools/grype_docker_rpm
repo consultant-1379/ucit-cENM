@@ -1,0 +1,141 @@
+#!/bin/bash
+#
+sg_list_file=$(pwd)/sg_list
+images_list_file=$(pwd)/image_list
+#
+if [ -z "$PWD" ]; then
+  export PWD=$(pwd)
+fi
+#
+docker_prefix="armdocker.rnd.ericsson.se/proj-enm"
+#
+grype_docker="armdocker.rnd.ericsson.se/proj-adp-cicd-drop/va-image-scanning-grype:latest"
+#
+docker rmi $grype_docker >/dev/null 2>&1 || echo "No image to remove"
+#
+header='"Package","Version Installed","Vulnerability ID","Severity","Path"'
+tmp="/tmp"
+template="$tmp/grype.tmpl"
+template_dir=$(dirname $template)
+#
+set_docker_tool () {
+  pass="/etc/passwd"
+  grp="/etc/group"
+  sock="/var/run/docker.sock"
+  options="--privileged -v $tmp:$tmp -v $pass:$pass -v $grp:$grp -v $sock:$sock -v $template_dir:$template_dir"
+  docker pull $grype_docker
+  GRYPE="docker run $options -ti $grype_docker grype"
+  echo "Using docker version: $GRYPE"
+}
+# Create grype output template file
+cat > $template <<_EOF_
+$header
+{{- range .Matches}}
+"{{.Artifact.Name}}","{{.Artifact.Version}}","{{.Vulnerability.ID}}","{{.Vulnerability.Severity}}","{{ (index .Artifact.Locations 0).RealPath }}"
+{{- end}}
+_EOF_
+#
+if grype version >/dev/null 2>&1 ; then
+  GRYPE="grype"
+else
+  if docker pull "$grype_docker" ; then
+    echo "Downloaded docker grype image: $grype_docker"
+  else
+    echo "Neither local grype nor docker available"
+    exit
+  fi
+  GRYPE="docker run --init --rm --user $(id -u):$(id -g) -w ${PWD} -v $tmp:$tmp -v ${PWD}:${PWD} -v /var/run/docker.sock:/var/run/docker.sock $(for x in $(id -G); do printf " --group-add %s" "$x"; done) armdocker.rnd.ericsson.se/proj-adp-cicd-drop/va-image-scanning-grype:latest grype"
+fi
+#
+# Name of dockerfile to be created
+#
+dockerfile="Dockerfile"
+#
+if [ -f $sg_list_file ]; then
+  project_list=$(grep -v '^#' $sg_list_file | sed 's/:.*//')
+else
+  if [ -f $images_list_file ]; then
+    project_list=$(grep -v '^#' $image_list_file | sed 's/:.*//')
+  else
+    project_list=""
+    for p in $*
+    do
+      if echo "$p" | grep -q '^-' ; then
+        case "x$p" in
+          "x-d") 
+                 set_docker_tool
+
+                 ;;
+          *) ;;
+        esac
+      else
+        project_list=$( (for x in $p $project_list; do echo $x ; done )| sort -u)
+      fi
+    done
+  fi
+fi
+#
+if [ "$GRYPE" == "grype" ]; then
+  echo "Using local grype installed"
+else
+  echo "Using docker grype installazion"
+fi
+#
+# Name of dockerfile to be created
+#
+data=$( date +%Y_%m_%d )
+#
+dir="GRYPE_$data"
+#
+rm -rf $dir 2>/dev/null
+mkdir $dir
+#
+echo "project_list=$project_list"
+#
+cd $dir
+#
+here=$(pwd)
+#
+tmp_image="tmp:tmp"
+#
+docker rm $tmp_image >/dev/null 2>&1
+#
+for prj in $project_list
+do
+#
+  cd $here
+  project=$(echo "$prj" | sed 's,.*/,,')
+  mkdir "$project"
+  cd "./$project"
+  out_file="${project}_out.csv"
+  #docker pull $docker_prefix/$project:latest
+  echo "$GRYPE -q docker:$docker_prefix/$project:latest -o template -t $template"
+  $GRYPE -q docker:$docker_prefix/$project:latest -o template -t $template |& dos2unix | tee $out_file.tmp
+  docker rmi $docker_prefix/$project:latest
+  grep '^"' $out_file.tmp > $out_file
+  rm $out_file.tmp
+  echo "FROM $docker_prefix/$project:latest" > $dockerfile
+  runscript="runscript.sh"
+  echo "COPY $runscript $runscript" >> $dockerfile
+  echo "RUN bash $runscript" >> $dockerfile
+  > $runscript
+  tail -n +2 "${out_file}" |
+  while true
+  do
+    read f
+    if [ -z "$f" ]; then break ; fi
+    path=$(echo "$f" | sed 's/.*,//')
+    artifact_version=$(echo "$f" | sed 's/,/:/' | sed 's/,.*//')
+    q='"'
+    echo "rpm -qf $path | grep -v ' ' | sed -e 's;^;xxx_$f,$q;' | sed 's/$/$q/' " >> $runscript
+  done
+  rpms_file="${project}_rpms.csv"
+  echo "$header"',"RPM"' > "$rpms_file"
+  docker build -t $tmp_image . | dos2unix | tee build.out
+  grep '^xxx_' build.out | sed 's/^xxx_//' >> "$rpms_file"
+  docker rmi $tmp_image >/dev/null 2>&1
+  docker rmi $$docker_prefix/$project:latest >/dev/null 2>&1
+  cd ..
+#
+done
+

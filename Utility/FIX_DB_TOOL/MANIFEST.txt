@@ -1,0 +1,5 @@
+clear                                         Clear created log files
+create_fix_entity_nocert.sh                   Create a limited time validity executable version of fix_entity_nocert.sh that can be distributed.
+fix_entity_nocert.sh                          Check possible fix on db and perform it if required (using "fix" as first argument)
+MANIFEST.txt                                  This file 
+README.txt                                    Brief explanation of commands.
